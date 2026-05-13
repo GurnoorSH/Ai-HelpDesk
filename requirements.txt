@@ -1,0 +1,11 @@
+qdrant-client[fastembed]
+openai
+cohere
+langchain-text-splitters
+unstructured[all-docs]
+tenacity
+pydantic
+requests
+fastapi
+uvicorn
+python-dotenv
