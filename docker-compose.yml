@@ -7,6 +7,6 @@ services:
       - ./qdrant_storage:/qdrant/storage
 
   orders-api:
-    build: .
+    build: ./orders_api
     ports:
       - "8000:8000"

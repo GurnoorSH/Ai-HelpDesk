@@ -13,6 +13,7 @@ It is built for local demos and recordings: Qdrant and the mock order API run in
 - `orders_api/` - a FastAPI mock order service.
 - `docker-compose.yml` - starts Qdrant and the orders API.
 - `requirements.txt` - Python dependencies for the local agent.
+- `orders_api/requirements.txt` - Python dependencies for the mock orders API container.
 - `.env.example` - template for API keys and service URLs.
 
 ## Requirements

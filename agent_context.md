@@ -31,7 +31,7 @@ Branch:
 
 `main`
 
-There are no commits yet at the time this context file was added.
+The repository has an initial project commit and a Groq/environment refactor commit.
 
 ## Important Files
 
@@ -39,7 +39,8 @@ There are no commits yet at the time this context file was added.
 - `docker-compose.yml` - starts Qdrant and the orders API service.
 - `orders_api/main.py` - mock FastAPI order status endpoint.
 - `orders_api/Dockerfile` - container for the orders API.
-- `requirements.txt` - local Python dependencies.
+- `orders_api/requirements.txt` - container dependencies for the orders API.
+- `requirements.txt` - local Python dependencies for the RAG agent.
 - `.env.example` - sample environment variables.
 - `.gitignore` - excludes local secrets, virtualenvs, caches, and Qdrant storage.
 - `README.md` - human-readable project overview and setup guide.
@@ -50,10 +51,10 @@ There are no commits yet at the time this context file was added.
 - The GitHub remote was added as `origin`.
 - The branch was renamed from `master` to `main`.
 - Git safe directory config was needed because Windows reported a different owner SID for the folder.
-- Docker Compose already contained:
+- Docker Compose contains:
   - `qdrant` on port `6333`
   - `orders-api` built from `./orders_api` on port `8000`
-- Added `orders_api/main.py` and `orders_api/Dockerfile` because Compose expected that folder.
+- The orders API container has its own small `orders_api/requirements.txt`.
 - Updated `Rag_Agent.py` to:
   - load `.env` with `python-dotenv`
   - default Qdrant to `http://localhost:6333`
@@ -74,8 +75,8 @@ There are no commits yet at the time this context file was added.
 
 - Do not commit `.env`.
 - Prefer local Qdrant at `http://localhost:6333` unless the user explicitly wants Qdrant Cloud.
-- The current `Rag_Agent.py` contains some mojibake in comments and strings from an earlier encoding issue. Be careful when patching around those lines.
+- `Rag_Agent.py` intentionally contains a few Unicode separators and arrows in comments/output labels.
 - Use small targeted patches for `Rag_Agent.py`; exact comment text may be hard to match.
-- The root `main.py` and root `Dockerfile` are still present from the original project state. The Docker Compose service now uses `orders_api/`.
+- There should be only one Dockerfile, at `orders_api/Dockerfile`.
 - If verifying Python, use the bundled runtime if system Python is still missing:
   `C:\Users\gurno\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
