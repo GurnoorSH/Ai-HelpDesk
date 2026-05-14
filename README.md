@@ -28,8 +28,10 @@ It is built for local demos and recordings: Qdrant and the mock order API run in
 From the project folder, create a virtual environment:
 
 ```powershell
-python -m venv venv
+py -3.11 -m venv venv
 ```
+
+Use Python 3.11 for this project. Newer local runtimes such as Python 3.14 may not support every dependency used by the agent yet.
 
 Activate it on Windows:
 
