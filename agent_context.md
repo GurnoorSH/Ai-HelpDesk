@@ -60,6 +60,13 @@ There are no commits yet at the time this context file was added.
   - default order API to `http://localhost:8000`
   - use `requests.get(...)` for order lookups
   - keep the old mock order function renamed as `_get_order_status_stub`
+- Switched the LLM configuration to Groq using the OpenAI-compatible client:
+  - `GROQ_API_KEY`
+  - `LLM_BASE_URL=https://api.groq.com/openai/v1`
+  - `FAST_LLM_MODEL=llama-3.1-8b-instant` for routing and extraction
+  - `FINAL_LLM_MODEL=llama-3.3-70b-versatile` for final customer-facing answer generation
+  - `OPENAI_API_KEY` is still accepted as a fallback if it was already used locally.
+- Replaced OpenAI `beta.chat.completions.parse(...)` with Groq JSON object mode plus Pydantic validation.
 - Added `.env.example`, `.gitignore`, and `requirements.txt`.
 - Syntax check passed using the bundled Codex Python runtime because `python` and `py` were not available on PATH.
 
@@ -72,4 +79,3 @@ There are no commits yet at the time this context file was added.
 - The root `main.py` and root `Dockerfile` are still present from the original project state. The Docker Compose service now uses `orders_api/`.
 - If verifying Python, use the bundled runtime if system Python is still missing:
   `C:\Users\gurno\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
-

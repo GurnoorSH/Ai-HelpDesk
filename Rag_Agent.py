@@ -25,6 +25,7 @@ Architecture:
 # ─────────────────────────────────────────────
 import os
 import re
+import json
 import logging
 from typing import Literal, Optional
 from dataclasses import dataclass, field
@@ -52,27 +53,30 @@ load_dotenv()
 # ── Credentials (Colab) ──────────────────────
 try:
     from google.colab import userdata
-    OPENAI_API_KEY  = userdata.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    GROQ_API_KEY    = userdata.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
     COHERE_API_KEY  = userdata.get("COHERE_API_KEY") or os.getenv("COHERE_API_KEY")
     QDRANT_URL      = userdata.get("QDRANT_URL") or os.getenv("QDRANT_URL", "http://localhost:6333")
     QDRANT_API_KEY  = userdata.get("QDRANT_API_KEY") or os.getenv("QDRANT_API_KEY")
     ORDER_API_URL   = userdata.get("ORDER_API_URL") or os.getenv("ORDER_API_URL", "http://localhost:8000")
+    LLM_BASE_URL    = userdata.get("LLM_BASE_URL") or os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    FAST_LLM_MODEL  = userdata.get("FAST_LLM_MODEL") or os.getenv("FAST_LLM_MODEL", "llama-3.1-8b-instant")
+    FINAL_LLM_MODEL = userdata.get("FINAL_LLM_MODEL") or os.getenv("FINAL_LLM_MODEL", "llama-3.3-70b-versatile")
 except Exception:
     # Fallback to environment variables (local / CI)
-    OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
+    GROQ_API_KEY    = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
     COHERE_API_KEY  = os.getenv("COHERE_API_KEY")
     QDRANT_URL      = os.getenv("QDRANT_URL", "http://localhost:6333")
     QDRANT_API_KEY  = os.getenv("QDRANT_API_KEY")
     ORDER_API_URL   = os.getenv("ORDER_API_URL", "http://localhost:8000")
-
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY or ""
+    LLM_BASE_URL    = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    FAST_LLM_MODEL  = os.getenv("FAST_LLM_MODEL", "llama-3.1-8b-instant")
+    FINAL_LLM_MODEL = os.getenv("FINAL_LLM_MODEL", "llama-3.3-70b-versatile")
 
 COLLECTION_NAME  = "helpdesk_policy"
 CHUNK_SIZE       = 512
 CHUNK_OVERLAP    = 64
 RETRIEVAL_LIMIT  = 6    # fetch more, reranker will cut down
 RERANK_TOP_N     = 3
-LLM_MODEL        = "gpt-4o"
 RERANK_MODEL     = "rerank-v3.5"
 
 
@@ -96,7 +100,10 @@ def build_qdrant_client() -> QdrantClient:
 
 
 qdrant  = build_qdrant_client()
-openai  = OpenAI()
+llm     = OpenAI(
+    api_key=GROQ_API_KEY or "missing-groq-api-key",
+    base_url=LLM_BASE_URL,
+)
 co      = cohere.Client(COHERE_API_KEY) if COHERE_API_KEY else None
 
 
@@ -201,8 +208,8 @@ def extract_order_id(text: str) -> Optional[str]:
 
     # LLM fallback
     try:
-        resp = openai.chat.completions.create(
-            model=LLM_MODEL,
+        resp = llm.chat.completions.create(
+            model=FAST_LLM_MODEL,
             messages=[{
                 "role": "user",
                 "content": (
@@ -262,7 +269,7 @@ class IntentResult(BaseModel):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
 def classify_intent(query: str, history_summary: str = "") -> IntentResult:
     """
-    Use structured output to get a reliable, typed intent classification.
+    Use Groq JSON object mode and validate the result with Pydantic.
     """
     system = (
         "You are an intent classifier for a customer helpdesk. "
@@ -271,18 +278,24 @@ def classify_intent(query: str, history_summary: str = "") -> IntentResult:
         "  POLICY   — returns, refunds, warranty, store rules, general how-to\n"
         "  ESCALATE — angry customer, complaint, legal threat, abuse\n"
         "  OTHER    — anything else\n"
-        "Return JSON matching the schema provided."
+        "Return only a valid JSON object with these keys: "
+        "category, confidence, reasoning. "
+        "category must be ORDER, POLICY, ESCALATE, or OTHER. "
+        "confidence must be a number between 0 and 1."
     )
     context = f"Conversation so far: {history_summary}\n\n" if history_summary else ""
-    resp = openai.beta.chat.completions.parse(
-        model=LLM_MODEL,
+    resp = llm.chat.completions.create(
+        model=FAST_LLM_MODEL,
         messages=[
             {"role": "system", "content": system},
             {"role": "user",   "content": f"{context}User query: {query}"},
         ],
-        response_format=IntentResult,
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        max_tokens=200,
     )
-    return resp.choices[0].message.parsed
+    content = resp.choices[0].message.content or "{}"
+    return IntentResult(**json.loads(content))
 
 
 # ─────────────────────────────────────────────
@@ -306,8 +319,8 @@ def generate_answer(query: str, context: str, messages: list[dict]) -> str:
         "content": f"Reference context:\n{context}\n\nQuestion: {query}"
     })
 
-    resp = openai.chat.completions.create(
-        model=LLM_MODEL,
+    resp = llm.chat.completions.create(
+        model=FINAL_LLM_MODEL,
         messages=payload,
         temperature=0.2,     # low temp for factual helpdesk responses
         max_tokens=512,

@@ -19,23 +19,32 @@ It is built for local demos and recordings: Qdrant and the mock order API run in
 
 - Docker Desktop
 - Python 3.11+
-- OpenAI API key
+- Groq API key
 - Cohere API key, optional but recommended for reranking
 
-## Setup
+## Setup A Virtual Environment
 
-Create a virtual environment:
+From the project folder, create a virtual environment:
 
 ```powershell
 python -m venv venv
+```
+
+Activate it on Windows:
+
+```powershell
 venv\Scripts\activate
 ```
 
-Install dependencies:
+If activation worked, your terminal prompt should start with `(venv)`.
+
+Install the Python dependencies:
 
 ```powershell
 pip install -r requirements.txt
 ```
+
+## Configure Secrets
 
 Create your local `.env` file from the example:
 
@@ -46,13 +55,22 @@ copy .env.example .env
 Then edit `.env`:
 
 ```env
-OPENAI_API_KEY=sk-...
+GROQ_API_KEY=gsk_...
+LLM_BASE_URL=https://api.groq.com/openai/v1
+FAST_LLM_MODEL=llama-3.1-8b-instant
+FINAL_LLM_MODEL=llama-3.3-70b-versatile
 COHERE_API_KEY=...
 QDRANT_URL=http://localhost:6333
 ORDER_API_URL=http://localhost:8000
 ```
 
-## Run The Services
+The agent uses `FAST_LLM_MODEL` for routing and order ID extraction, and `FINAL_LLM_MODEL` for final customer-facing answers.
+
+## Run Everything
+
+Use two terminals.
+
+### Terminal 1: Start Docker Services
 
 Start Qdrant and the mock order API:
 
@@ -71,9 +89,21 @@ Example order IDs:
 - `456`
 - `ORD-001`
 
-## Run The Agent
+You can quickly check the order API in your browser:
 
-In a second terminal, with the virtual environment activated:
+```text
+http://localhost:8000/orders/123
+```
+
+### Terminal 2: Run The Agent
+
+Open a second terminal in the project folder, then activate the virtual environment:
+
+```powershell
+venv\Scripts\activate
+```
+
+Run the agent:
 
 ```powershell
 python Rag_Agent.py
@@ -81,9 +111,18 @@ python Rag_Agent.py
 
 The demo runner sends a few sample queries through the agent, including order tracking and policy-style questions.
 
+## Stop Everything
+
+To stop Docker services, go back to Terminal 1 and press `Ctrl+C`.
+
+To fully remove the running containers:
+
+```powershell
+docker compose down
+```
+
 ## Notes
 
 The policy/RAG path expects documents to be ingested into Qdrant before it can answer policy questions. The order-status path can work immediately once Docker Compose is running.
 
 Do not commit your `.env` file. It contains secrets and is already ignored by Git.
-
