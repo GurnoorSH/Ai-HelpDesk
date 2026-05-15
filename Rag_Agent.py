@@ -27,25 +27,30 @@ import os
 import re
 import json
 import logging
-from typing import Literal, Optional
+import uuid
+from typing import Any, Literal, Optional
+from pathlib import Path
 from dataclasses import dataclass, field
 
 import requests
+from pypdf import PdfReader
 from pydantic import BaseModel
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
+from qdrant_client.hybrid.fusion import reciprocal_rank_fusion
 from openai import OpenAI
 import cohere
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from unstructured.partition.auto import partition
 
 # ── Logging ──────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 load_dotenv()
@@ -73,11 +78,28 @@ except Exception:
     FINAL_LLM_MODEL = os.getenv("FINAL_LLM_MODEL", "llama-3.3-70b-versatile")
 
 COLLECTION_NAME  = "helpdesk_policy"
+BASE_DIR         = Path(__file__).resolve().parent
+POLICY_DOC_PATH  = os.getenv("POLICY_DOC_PATH", str(BASE_DIR / "Store_Return_Policy.pdf"))
 CHUNK_SIZE       = 512
 CHUNK_OVERLAP    = 64
 RETRIEVAL_LIMIT  = 6    # fetch more, reranker will cut down
 RERANK_TOP_N     = 3
 RERANK_MODEL     = "rerank-v3.5"
+PARTITION_STRATEGY = os.getenv("UNSTRUCTURED_STRATEGY", "fast")
+UNSUPPORTED_ANSWER = (
+    "I don't have that information. Would you like me to connect you with a human agent?"
+)
+
+SENSITIVE_INPUT_PATTERNS = {
+    "credit_card": re.compile(r"\b(?:\d[ -]*?){13,19}\b"),
+    "ssn": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    "password": re.compile(r"\b(?:password|passcode|pin)\s*[:=]\s*\S+", re.IGNORECASE),
+    "api_key": re.compile(r"\b(?:sk|gsk|pk|rk)_[A-Za-z0-9_-]{20,}\b"),
+}
+TOXIC_INPUT_PATTERN = re.compile(
+    r"\b(?:kill yourself|kys|worthless|idiot|stupid|moron)\b",
+    re.IGNORECASE,
+)
 
 
 # ─────────────────────────────────────────────
@@ -95,7 +117,7 @@ def build_qdrant_client() -> QdrantClient:
         c = QdrantClient(url=QDRANT_URL)
 
     c.set_model("BAAI/bge-small-en-v1.5")       # Dense
-    c.set_sparse_model("naver/splade-v3")        # Sparse
+    c.set_sparse_model("Qdrant/bm25")            # Sparse
     return c
 
 
@@ -107,24 +129,112 @@ llm     = OpenAI(
 co      = cohere.Client(COHERE_API_KEY) if COHERE_API_KEY else None
 
 
+def ensure_policy_collection() -> None:
+    """
+    Create the Qdrant collection used by the policy RAG path if needed.
+    """
+    existing = [c.name for c in qdrant.get_collections().collections]
+    if COLLECTION_NAME in existing:
+        return
+
+    log.info("Creating collection '%s'", COLLECTION_NAME)
+    qdrant.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=qdrant.get_fastembed_vector_params(),
+        sparse_vectors_config=qdrant.get_fastembed_sparse_vector_params(),
+    )
+
+
+def point_id_for_chunk(source: str, chunk_index: int) -> str:
+    """
+    Stable IDs make repeated ingestion update chunks instead of duplicating them.
+    """
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"{COLLECTION_NAME}:{source}:{chunk_index}").hex
+
+
 # ─────────────────────────────────────────────
 # 4. INGESTION — Chunked, Structure-Aware
 # ─────────────────────────────────────────────
-def ingest_document(file_path: str, doc_type: str = "policy") -> int:
+def infer_document_metadata(path: Path, doc_type: str) -> dict[str, Any]:
+    """
+    Infer simple filterable metadata from the file name and document type.
+    Explicit metadata can be layered on top when ingesting.
+    """
+    year_match = re.search(r"\b(20\d{2})\b", path.stem)
+    inferred = {
+        "source": path.name,
+        "type": doc_type,
+    }
+    if year_match:
+        inferred["year"] = int(year_match.group(1))
+    return inferred
+
+
+def build_metadata_filter(metadata_filter: Optional[dict[str, Any]] = None) -> Optional[models.Filter]:
+    """
+    Convert a simple equality/range metadata filter into a Qdrant filter.
+    Supported range keys: year_min, year_max.
+    """
+    if not metadata_filter:
+        return None
+
+    must: list[Any] = []
+    for key, value in metadata_filter.items():
+        if value is None:
+            continue
+        if key in {"year_min", "year_max"}:
+            continue
+        must.append(
+            models.FieldCondition(
+                key=key,
+                match=models.MatchValue(value=value),
+            )
+        )
+
+    range_kwargs = {
+        name: metadata_filter[source_key]
+        for name, source_key in (("gte", "year_min"), ("lte", "year_max"))
+        if metadata_filter.get(source_key) is not None
+    }
+    if range_kwargs:
+        must.append(
+            models.FieldCondition(
+                key="year",
+                range=models.Range(**range_kwargs),
+            )
+        )
+
+    return models.Filter(must=must) if must else None
+
+
+def ingest_document(
+    file_path: str,
+    doc_type: str = "policy",
+    metadata: Optional[dict[str, Any]] = None,
+) -> int:
     """
     Parse a document, chunk it properly, and upsert into Qdrant.
     Returns the number of chunks ingested.
     """
-    log.info("Partitioning document: %s", file_path)
-    elements = partition(filename=file_path, strategy="hi_res")
+    path = Path(file_path).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
 
-    raw_text = "\n\n".join(
-        str(el) for el in elements
-        if el.category in {"NarrativeText", "Table", "ListItem", "Title"}
-    )
+    log.info("Partitioning document: %s", path)
+    if path.suffix.lower() == ".pdf":
+        reader = PdfReader(str(path))
+        raw_text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    else:
+        from unstructured.partition.auto import partition
+
+        elements = partition(filename=str(path), strategy=PARTITION_STRATEGY)
+        raw_text = "\n\n".join(
+            str(el) for el in elements
+            if el.category in {"NarrativeText", "Table", "ListItem", "Title"}
+        )
 
     if not raw_text.strip():
-        raise ValueError(f"No usable text extracted from {file_path}")
+        raise ValueError(f"No usable text extracted from {path}")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -134,21 +244,54 @@ def ingest_document(file_path: str, doc_type: str = "policy") -> int:
     chunks = splitter.split_text(raw_text)
     log.info("Split into %d chunks", len(chunks))
 
-    # Ensure collection exists
-    existing = [c.name for c in qdrant.get_collections().collections]
-    if COLLECTION_NAME not in existing:
-        # client.add() auto-creates, but being explicit is safer
-        log.info("Collection '%s' will be created on first upsert", COLLECTION_NAME)
+    ensure_policy_collection()
 
-    metadata = [
-        {"source": os.path.basename(file_path), "type": doc_type, "chunk_index": i}
-        for i, _ in enumerate(chunks)
+    qdrant.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="source",
+                        match=models.MatchValue(value=path.name),
+                    )
+                ]
+            )
+        ),
+        wait=True,
+    )
+
+    base_metadata = infer_document_metadata(path, doc_type)
+    if metadata:
+        base_metadata.update(metadata)
+
+    points = [
+        models.PointStruct(
+            id=point_id_for_chunk(path.name, i),
+            vector={
+                qdrant.get_vector_field_name(): models.Document(
+                    text=chunk,
+                    model=qdrant.embedding_model_name,
+                ),
+                qdrant.get_sparse_vector_field_name(): models.Document(
+                    text=chunk,
+                    model=qdrant.sparse_embedding_model_name,
+                ),
+            },
+            payload={
+                **base_metadata,
+                "document": chunk,
+                "chunk_index": i,
+                "parent_context": "\n\n".join(chunks[max(0, i - 1):min(len(chunks), i + 2)]),
+            },
+        )
+        for i, chunk in enumerate(chunks)
     ]
 
-    qdrant.add(
+    qdrant.upsert(
         collection_name=COLLECTION_NAME,
-        documents=chunks,
-        metadata=metadata,
+        points=points,
+        wait=True,
     )
 
     log.info("Ingestion complete: %d chunks stored.", len(chunks))
@@ -158,20 +301,48 @@ def ingest_document(file_path: str, doc_type: str = "policy") -> int:
 # ─────────────────────────────────────────────
 # 5. RETRIEVAL — Hybrid + Rerank
 # ─────────────────────────────────────────────
-def retrieve(query: str) -> list[str]:
+def retrieve(query: str, metadata_filter: Optional[dict[str, Any]] = None) -> list[str]:
     """
-    Hybrid search → Cohere reranking → top-N passages.
+    Hybrid search -> Cohere reranking -> top-N parent passages.
+    Small chunks are searched and reranked; larger neighboring context is sent
+    to the answer model.
     """
-    hits = qdrant.query(
+    qdrant_filter = build_metadata_filter(metadata_filter)
+    dense_response = qdrant.query_points(
         collection_name=COLLECTION_NAME,
-        query_text=query,
+        query=models.Document(text=query, model=qdrant.embedding_model_name),
+        using=qdrant.get_vector_field_name(),
+        query_filter=qdrant_filter,
+        limit=RETRIEVAL_LIMIT,
+        with_payload=True,
+    )
+    sparse_response = qdrant.query_points(
+        collection_name=COLLECTION_NAME,
+        query=models.Document(text=query, model=qdrant.sparse_embedding_model_name),
+        using=qdrant.get_sparse_vector_field_name(),
+        query_filter=qdrant_filter,
+        limit=RETRIEVAL_LIMIT,
+        with_payload=True,
+    )
+    hits = reciprocal_rank_fusion(
+        [dense_response.points, sparse_response.points],
         limit=RETRIEVAL_LIMIT,
     )
-    docs = [h.document for h in hits if h.document]
+    candidates = [
+        {
+            "document": h.payload.get("document", ""),
+            "parent_context": h.payload.get("parent_context") or h.payload.get("document", ""),
+            "source": h.payload.get("source", "unknown"),
+            "chunk_index": h.payload.get("chunk_index", "unknown"),
+        }
+        for h in hits
+        if h.payload and h.payload.get("document")
+    ]
 
-    if not docs:
+    if not candidates:
         return []
 
+    docs = [candidate["document"] for candidate in candidates]
     if co:
         try:
             reranked = co.rerank(
@@ -180,11 +351,24 @@ def retrieve(query: str) -> list[str]:
                 model=RERANK_MODEL,
                 top_n=RERANK_TOP_N,
             )
-            return [docs[r.index] for r in reranked.results]
+            return [
+                (
+                    f"Source: {candidates[r.index]['source']} "
+                    f"(chunk {candidates[r.index]['chunk_index']})\n"
+                    f"{candidates[r.index]['parent_context']}"
+                )
+                for r in reranked.results
+            ]
         except Exception as e:
             log.warning("Cohere rerank failed (%s), using raw hits", e)
 
-    return docs[:RERANK_TOP_N]
+    return [
+        (
+            f"Source: {candidate['source']} (chunk {candidate['chunk_index']})\n"
+            f"{candidate['parent_context']}"
+        )
+        for candidate in candidates[:RERANK_TOP_N]
+    ]
 
 
 # ─────────────────────────────────────────────
@@ -266,6 +450,66 @@ class IntentResult(BaseModel):
     reasoning: str             # brief explanation (useful for debugging)
 
 
+class GuardrailResult(BaseModel):
+    allowed: bool
+    reason: str = ""
+    response: str = ""
+
+
+class CriticResult(BaseModel):
+    supported: bool
+    reason: str = ""
+
+
+def check_input_guardrails(user_query: str) -> GuardrailResult:
+    """
+    Deterministic pre-LLM guardrails for obvious sensitive or abusive input.
+    Advanced moderation providers can replace this boundary later.
+    """
+    if TOXIC_INPUT_PATTERN.search(user_query):
+        return GuardrailResult(
+            allowed=False,
+            reason="toxic_input",
+            response=(
+                "I can help with the support issue, but I can't continue with abusive language. "
+                "Please rephrase your request and I'll help from there."
+            ),
+        )
+
+    matched_sensitive_types = [
+        name for name, pattern in SENSITIVE_INPUT_PATTERNS.items()
+        if pattern.search(user_query)
+    ]
+    if matched_sensitive_types:
+        return GuardrailResult(
+            allowed=False,
+            reason="sensitive_input",
+            response=(
+                "Please remove sensitive details like full card numbers, passwords, SSNs, "
+                "or API keys before sending your message. I can still help with an order ID "
+                "or a general policy question."
+            ),
+        )
+
+    return GuardrailResult(allowed=True)
+
+
+def extract_metadata_filter(query: str) -> dict[str, Any]:
+    """
+    Pull simple metadata constraints from natural language.
+    Example: "only search 2026 policies" -> {"year": 2026, "type": "policy"}.
+    """
+    metadata_filter: dict[str, Any] = {}
+    year_match = re.search(r"\b(20\d{2})\b", query)
+    if year_match:
+        metadata_filter["year"] = int(year_match.group(1))
+
+    if re.search(r"\bpolic(?:y|ies)\b", query, re.IGNORECASE):
+        metadata_filter["type"] = "policy"
+
+    return metadata_filter
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
 def classify_intent(query: str, history_summary: str = "") -> IntentResult:
     """
@@ -278,6 +522,8 @@ def classify_intent(query: str, history_summary: str = "") -> IntentResult:
         "  POLICY   — returns, refunds, warranty, store rules, general how-to\n"
         "  ESCALATE — angry customer, complaint, legal threat, abuse\n"
         "  OTHER    — anything else\n"
+        "Treat order IDs like #456, ORD-001, tracking numbers, or phrases like "
+        "'where is my order' as strong ORDER signals.\n"
         "Return only a valid JSON object with these keys: "
         "category, confidence, reasoning. "
         "category must be ORDER, POLICY, ESCALATE, or OTHER. "
@@ -328,6 +574,55 @@ def generate_answer(query: str, context: str, messages: list[dict]) -> str:
     return resp.choices[0].message.content.strip()
 
 
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(min=1, max=4))
+def critique_answer(query: str, context: str, answer: str) -> CriticResult:
+    """
+    Second-pass faithfulness check. The critic must reject answers that add
+    policy claims not supported by the retrieved context.
+    """
+    resp = llm.chat.completions.create(
+        model=FAST_LLM_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a strict RAG faithfulness critic. Decide whether the answer is "
+                    "fully supported by the reference context. Return only JSON with keys "
+                    "supported and reason."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Reference context:\n{context}\n\n"
+                    f"Question: {query}\n\n"
+                    f"Answer: {answer}"
+                ),
+            },
+        ],
+        response_format={"type": "json_object"},
+        temperature=0,
+        max_tokens=160,
+    )
+    content = resp.choices[0].message.content or "{}"
+    return CriticResult(**json.loads(content))
+
+
+def generate_verified_answer(query: str, context: str, messages: list[dict]) -> str:
+    """
+    Generate an answer, then fall back if a critic cannot verify support.
+    """
+    answer = generate_answer(query, context, messages)
+    try:
+        critic = critique_answer(query, context, answer)
+        if not critic.supported:
+            log.warning("Answer rejected by critic: %s", critic.reason)
+            return UNSUPPORTED_ANSWER
+    except Exception as e:
+        log.warning("Answer critic failed (%s), returning generated answer", e)
+    return answer
+
+
 # ─────────────────────────────────────────────
 # 10. CONVERSATION SESSION
 # ─────────────────────────────────────────────
@@ -359,6 +654,11 @@ def agent_loop(user_query: str, session: Session) -> str:
       3. Generate grounded response
       4. Update session memory
     """
+    guardrail = check_input_guardrails(user_query)
+    if not guardrail.allowed:
+        log.warning("Guardrail blocked query: %s", guardrail.reason)
+        return guardrail.response
+
     session.add("user", user_query)
 
     # ── Step 1: Intent Classification ────────
@@ -382,7 +682,7 @@ def agent_loop(user_query: str, session: Session) -> str:
                 reply = f"Here's the status for order **{order_id}**: {status}"
 
         elif intent.category == "POLICY":
-            passages = retrieve(user_query)
+            passages = retrieve(user_query, metadata_filter=extract_metadata_filter(user_query))
             if not passages:
                 reply = (
                     "I couldn't find relevant policy information. "
@@ -390,7 +690,7 @@ def agent_loop(user_query: str, session: Session) -> str:
                 )
             else:
                 context = "\n\n---\n\n".join(passages)
-                reply = generate_answer(user_query, context, session.messages[:-1])
+                reply = generate_verified_answer(user_query, context, session.messages[:-1])
 
         elif intent.category == "ESCALATE":
             reply = (
@@ -402,8 +702,8 @@ def agent_loop(user_query: str, session: Session) -> str:
 
         else:  # OTHER
             reply = (
-                "I'm here to help with order tracking and store policies. "
-                "Could you clarify what you need, or would you like to speak with a human agent?"
+                "I can help with order tracking, returns, refunds, and store policies. "
+                "For anything outside that, I can connect you with a human agent."
             )
 
     except Exception as e:
@@ -422,7 +722,7 @@ def agent_loop(user_query: str, session: Session) -> str:
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     # Uncomment to ingest your policy PDF first:
-    # ingest_document("your_policy.pdf", doc_type="policy")
+    ingest_document(POLICY_DOC_PATH, doc_type="policy")
 
     session = Session()
 

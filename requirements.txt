@@ -5,6 +5,7 @@ langchain-text-splitters
 unstructured[all-docs]
 tenacity
 pydantic
+pypdf
 requests
 fastapi
 uvicorn

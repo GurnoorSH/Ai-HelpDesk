@@ -41,6 +41,8 @@ The repository has an initial project commit and a Groq/environment refactor com
 - `orders_api/Dockerfile` - container for the orders API.
 - `orders_api/requirements.txt` - container dependencies for the orders API.
 - `requirements.txt` - local Python dependencies for the RAG agent.
+- `evaluate_rag.py` - lightweight RAG evaluator for retrieval and generated-answer quality.
+- `synthesize_eval_set.py` - synthetic eval-set generator from the policy PDF.
 - `.env.example` - sample environment variables.
 - `.gitignore` - excludes local secrets, virtualenvs, caches, and Qdrant storage.
 - `README.md` - human-readable project overview and setup guide.
@@ -58,7 +60,10 @@ The repository has an initial project commit and a Groq/environment refactor com
 - Updated `Rag_Agent.py` to:
   - load `.env` with `python-dotenv`
   - default Qdrant to `http://localhost:6333`
+  - use FastEmbed dense model `BAAI/bge-small-en-v1.5` and sparse model `Qdrant/bm25`
   - default order API to `http://localhost:8000`
+  - default policy ingestion to `Store_Return_Policy.pdf`, overridable with `POLICY_DOC_PATH`
+  - default document partitioning to `UNSTRUCTURED_STRATEGY=fast` to avoid heavy OCR/inference dependencies for normal PDFs
   - use `requests.get(...)` for order lookups
   - keep the old mock order function renamed as `_get_order_status_stub`
 - Switched the LLM configuration to Groq using the OpenAI-compatible client:
@@ -68,6 +73,14 @@ The repository has an initial project commit and a Groq/environment refactor com
   - `FINAL_LLM_MODEL=llama-3.3-70b-versatile` for final customer-facing answer generation
   - `OPENAI_API_KEY` is still accepted as a fallback if it was already used locally.
 - Replaced OpenAI `beta.chat.completions.parse(...)` with Groq JSON object mode plus Pydantic validation.
+- Added RAG quality improvements:
+  - deterministic pre-LLM guardrails for obvious sensitive or abusive input
+  - metadata-aware retrieval filters for fields such as `year` and `type`
+  - small-to-big retrieval by reranking small chunks and feeding neighboring `parent_context`
+  - a critic pass that rejects unsupported policy answers
+  - `evaluate_rag.py` for repeatable faithfulness, answer-relevancy, context precision/recall, and ROUGE-L scoring against golden answers
+  - `synthesize_eval_set.py` for generating 50+ diverse eval cases from the PDF
+- Left durable memory and async/concurrent serving in future scope; `Session` remains intentionally in-memory for this demo.
 - Added `.env.example`, `.gitignore`, and `requirements.txt`.
 - Syntax check passed using the bundled Codex Python runtime because `python` and `py` were not available on PATH.
 
