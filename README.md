@@ -69,11 +69,26 @@ QDRANT_URL=http://localhost:6333
 ORDER_API_URL=http://localhost:8000
 POLICY_DOC_PATH=Store_Return_Policy.pdf
 UNSTRUCTURED_STRATEGY=fast
+ENABLE_HYDE=true
+HYDE_MODEL=llama-3.1-8b-instant
+HYDE_MAX_TOKENS=180
+ENABLE_CONTEXT_COMPRESSION=true
+COMPRESSION_MODEL=llama-3.1-8b-instant
+SEMANTIC_BREAK_THRESHOLD=0.70
+ENABLE_LANGSMITH=false
+LANGSMITH_API_KEY=
+LANGSMITH_PROJECT=ai-helpdesk-rag
+GROQ_MODEL_PRICES_JSON={}
 ```
 
 The agent uses `FAST_LLM_MODEL` for routing and order ID extraction, and `FINAL_LLM_MODEL` for final customer-facing answers.
 `POLICY_DOC_PATH` points to the PDF that should be ingested into Qdrant.
 `UNSTRUCTURED_STRATEGY=fast` keeps PDF ingestion lightweight for normal text PDFs. Use `hi_res` only if you install the extra OCR/inference dependencies.
+`ENABLE_HYDE` uses a Groq fast model to generate a hypothetical answer for dense retrieval while sparse/BM25 search still uses the original query.
+`ENABLE_CONTEXT_COMPRESSION` uses a Groq fast model to trim reranked parent context before final answer generation.
+`SEMANTIC_BREAK_THRESHOLD` controls how aggressively adjacent document blocks are split when semantic similarity drops.
+`ENABLE_LANGSMITH=true` turns on LangSmith spans only when `LANGSMITH_API_KEY` is also set.
+`GROQ_MODEL_PRICES_JSON` controls cost attribution without hardcoded prices. Use JSON shaped like `{"model-name":{"input_per_1m":0.0,"output_per_1m":0.0}}`.
 
 ## Run Everything
 
@@ -125,7 +140,10 @@ The demo runner sends a few sample queries through the agent, including order tr
 The policy path now includes a few production-style safeguards:
 
 - Metadata filtering: questions that mention a year such as `2026` are used as Qdrant payload filters, and ingested documents store `source`, `type`, `year`, and `chunk_index`.
-- Small-to-big retrieval: the vector search and reranker operate on small chunks, while the answer model receives the neighboring parent context around each selected chunk.
+- Structure-aware chunking: ingestion preserves section names, element categories such as titles/tables/lists, block indexes, and neighboring parent context in Qdrant payloads.
+- HyDE retrieval: dense search can use a Groq-generated hypothetical answer for better semantic recall, while sparse/BM25 search keeps the original query for exact keyword matching.
+- Small-to-big retrieval: the vector search and reranker operate on small chunks, while the answer model receives compressed neighboring parent context around each selected chunk.
+- Contextual compression: after reranking, a Groq fast model removes irrelevant sentences from retrieved parent context before it reaches the final answer model.
 - Guardrails: obvious sensitive inputs such as card numbers, SSNs, passwords, and API keys are blocked before they reach the LLM. Highly abusive input is also stopped before routing.
 - Self-correction: policy answers pass through a second critic model. If the critic says the answer is not supported by the retrieved context, the agent falls back to the human-handoff response.
 
@@ -155,6 +173,15 @@ Aim for 50-100 cases before treating the score as production signal. The set sho
 python evaluate_rag.py .\rag_eval_set.json
 ```
 
+Each evaluation writes a timestamped JSON report under `reports/` unless you pass `--no-report`.
+To add optional RAGAS metrics, install the full requirements and run:
+
+```powershell
+python evaluate_rag.py .\rag_eval_set.json --ragas
+```
+
+RAGAS uses a Groq judge model through `langchain-groq` and local FastEmbed embeddings for embedding-based metrics. If the optional RAGAS dependencies or calls fail, the lightweight evaluator still finishes and records the RAGAS error in the report.
+
 The evaluator reports:
 
 - `faithfulness`: whether the generated answer is supported by retrieved context.
@@ -162,12 +189,23 @@ The evaluator reports:
 - `context_precision`: whether retrieval avoided filler or junk context.
 - `context_recall`: whether retrieval captured all facts needed for the expected/golden answer.
 - `rouge_l`: lexical overlap between the generated answer and the `golden_answer`.
+- token and cost metrics by stage, including router, HyDE, compression, final answer, critic, and evaluator stages when usage data is returned by Groq-compatible APIs.
 
 Run this evaluator every time you change retrieval settings in `Rag_Agent.py`, especially `CHUNK_SIZE`, `CHUNK_OVERLAP`, `RETRIEVAL_LIMIT`, `RERANK_TOP_N`, or `RERANK_MODEL`.
 
 If `faithfulness` is low, chunks may be too small or the reranker may be dropping required context. If `answer_relevancy` is low, inspect the retrieved passages and tune hybrid retrieval or reranking. If `context_precision` is low, too much filler is being retrieved. If `context_recall` is low, retrieval is missing required facts.
 
 For a larger production system, replace or supplement this with RAGAS, DeepEval, or BERTScore once you have a stable labeled test set.
+
+### View The Eval Dashboard
+
+After you have at least one report in `reports/`, launch the local Streamlit dashboard:
+
+```powershell
+streamlit run rag_dashboard.py
+```
+
+The dashboard shows latest scores, RAGAS status, metric trends across saved reports, low-scoring cases, generated answers, golden answers, and retrieved context.
 
 ## Stop Everything
 

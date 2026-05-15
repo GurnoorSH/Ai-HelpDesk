@@ -10,3 +10,10 @@ requests
 fastapi
 uvicorn
 python-dotenv
+streamlit
+pandas
+ragas
+datasets
+langchain-groq
+langchain-community
+langsmith

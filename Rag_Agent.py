@@ -28,6 +28,7 @@ import re
 import json
 import logging
 import uuid
+import math
 from typing import Any, Literal, Optional
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -43,6 +44,13 @@ from openai import OpenAI
 import cohere
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from observability import (
+    current_usage_report,
+    record_llm_response,
+    trace_span,
+    usage_run,
+)
 
 # ── Logging ──────────────────────────────────
 logging.basicConfig(
@@ -86,6 +94,12 @@ RETRIEVAL_LIMIT  = 6    # fetch more, reranker will cut down
 RERANK_TOP_N     = 3
 RERANK_MODEL     = "rerank-v3.5"
 PARTITION_STRATEGY = os.getenv("UNSTRUCTURED_STRATEGY", "fast")
+ENABLE_HYDE = os.getenv("ENABLE_HYDE", "true").lower() not in {"0", "false", "no"}
+HYDE_MODEL = os.getenv("HYDE_MODEL", FAST_LLM_MODEL)
+HYDE_MAX_TOKENS = int(os.getenv("HYDE_MAX_TOKENS", "180"))
+ENABLE_CONTEXT_COMPRESSION = os.getenv("ENABLE_CONTEXT_COMPRESSION", "true").lower() not in {"0", "false", "no"}
+COMPRESSION_MODEL = os.getenv("COMPRESSION_MODEL", FAST_LLM_MODEL)
+SEMANTIC_BREAK_THRESHOLD = float(os.getenv("SEMANTIC_BREAK_THRESHOLD", "0.70"))
 UNSUPPORTED_ANSWER = (
     "I don't have that information. Would you like me to connect you with a human agent?"
 )
@@ -155,6 +169,23 @@ def point_id_for_chunk(source: str, chunk_index: int) -> str:
 # ─────────────────────────────────────────────
 # 4. INGESTION — Chunked, Structure-Aware
 # ─────────────────────────────────────────────
+@dataclass
+class DocumentBlock:
+    text: str
+    category: str
+    section: str
+    index: int
+
+
+@dataclass
+class StructuredChunk:
+    text: str
+    section: str
+    categories: list[str]
+    block_indexes: list[int]
+    parent_context: str = ""
+
+
 def infer_document_metadata(path: Path, doc_type: str) -> dict[str, Any]:
     """
     Infer simple filterable metadata from the file name and document type.
@@ -207,6 +238,178 @@ def build_metadata_filter(metadata_filter: Optional[dict[str, Any]] = None) -> O
     return models.Filter(must=must) if must else None
 
 
+def _extract_text_with_pypdf(path: Path) -> str:
+    reader = PdfReader(str(path))
+    return "\n\n".join(page.extract_text() or "" for page in reader.pages).strip()
+
+
+def _fallback_recursive_chunks(raw_text: str) -> list[StructuredChunk]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    return [
+        StructuredChunk(
+            text=chunk,
+            section="Untitled",
+            categories=["FallbackText"],
+            block_indexes=[i],
+        )
+        for i, chunk in enumerate(splitter.split_text(raw_text))
+    ]
+
+
+def _fallback_blocks_from_text(raw_text: str) -> list[DocumentBlock]:
+    return [
+        DocumentBlock(text=text.strip(), category="FallbackText", section="Untitled", index=i)
+        for i, text in enumerate(re.split(r"\n{2,}", raw_text))
+        if text.strip()
+    ]
+
+
+def _partition_document(path: Path) -> list[DocumentBlock]:
+    """
+    Use Unstructured for PDFs/Markdown/HTML and keep element-level structure.
+    Falls back to pypdf/plain recursive chunks if Unstructured cannot parse.
+    """
+    try:
+        from unstructured.partition.auto import partition
+
+        elements = partition(filename=str(path), strategy=PARTITION_STRATEGY)
+    except Exception as e:
+        log.warning("Unstructured partition failed for %s (%s); falling back", path.name, e)
+        raw_text = _extract_text_with_pypdf(path) if path.suffix.lower() == ".pdf" else path.read_text(
+            encoding="utf-8"
+        )
+        blocks = _fallback_blocks_from_text(raw_text)
+        if not blocks:
+            raise ValueError(f"No usable text extracted from {path}")
+        return blocks
+
+    blocks: list[DocumentBlock] = []
+    current_section = "Untitled"
+    allowed_categories = {"NarrativeText", "Table", "ListItem", "Title"}
+    for index, element in enumerate(elements):
+        category = getattr(element, "category", element.__class__.__name__)
+        text = str(element).strip()
+        if not text or category not in allowed_categories:
+            continue
+        if category == "Title":
+            current_section = text
+        blocks.append(
+            DocumentBlock(
+                text=text,
+                category=category,
+                section=current_section,
+                index=index,
+            )
+        )
+
+    if not blocks:
+        raw_text = _extract_text_with_pypdf(path) if path.suffix.lower() == ".pdf" else path.read_text(
+            encoding="utf-8"
+        )
+        blocks = _fallback_blocks_from_text(raw_text)
+    if not blocks:
+        raise ValueError(f"No usable text extracted from {path}")
+    return blocks
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def _semantic_breaks(texts: list[str]) -> set[int]:
+    """
+    Return indexes where a new chunk should start based on adjacent semantic drift.
+    Uses the same local FastEmbed model configured on the Qdrant client.
+    """
+    if len(texts) < 2:
+        return set()
+    try:
+        from fastembed import TextEmbedding
+
+        embedding_model = TextEmbedding(model_name=qdrant.embedding_model_name)
+        embeddings = [list(vector) for vector in embedding_model.embed(texts)]
+    except Exception as e:
+        log.warning("Semantic boundary detection unavailable (%s); using size-only chunks", e)
+        return set()
+
+    breaks: set[int] = set()
+    for index in range(1, len(embeddings)):
+        similarity = _cosine_similarity(embeddings[index - 1], embeddings[index])
+        if similarity < SEMANTIC_BREAK_THRESHOLD:
+            breaks.add(index)
+    return breaks
+
+
+def _chunks_from_block_group(section: str, blocks: list[DocumentBlock]) -> list[StructuredChunk]:
+    text = "\n\n".join(block.text for block in blocks)
+    categories = sorted({block.category for block in blocks})
+    block_indexes = [block.index for block in blocks]
+    if len(text) <= CHUNK_SIZE * 1.4:
+        return [
+            StructuredChunk(
+                text=text,
+                section=section,
+                categories=categories,
+                block_indexes=block_indexes,
+            )
+        ]
+
+    split_chunks = _fallback_recursive_chunks(text)
+    for chunk in split_chunks:
+        chunk.section = section
+        chunk.categories = categories
+        chunk.block_indexes = block_indexes
+    return split_chunks
+
+
+def _build_structured_chunks(blocks: list[DocumentBlock]) -> list[StructuredChunk]:
+    """
+    Group by document section first, then split oversized sections using semantic
+    boundaries between adjacent blocks while preserving tables/lists/headings.
+    """
+    chunks: list[StructuredChunk] = []
+    section_groups: list[tuple[str, list[DocumentBlock]]] = []
+    for block in blocks:
+        if not section_groups or section_groups[-1][0] != block.section:
+            section_groups.append((block.section, []))
+        section_groups[-1][1].append(block)
+
+    for section, section_blocks in section_groups:
+        section_text = "\n\n".join(block.text for block in section_blocks)
+        if len(section_text) <= CHUNK_SIZE:
+            chunks.extend(_chunks_from_block_group(section, section_blocks))
+            continue
+
+        break_indexes = _semantic_breaks([block.text for block in section_blocks])
+        current: list[DocumentBlock] = []
+        for local_index, block in enumerate(section_blocks):
+            current_text = "\n\n".join(item.text for item in current)
+            would_exceed = current and len(current_text) + len(block.text) + 2 > CHUNK_SIZE
+            semantic_break = current and local_index in break_indexes and len(current_text) >= CHUNK_SIZE * 0.45
+            if would_exceed or semantic_break:
+                chunks.extend(_chunks_from_block_group(section, current))
+                current = []
+            current.append(block)
+
+        if current:
+            chunks.extend(_chunks_from_block_group(section, current))
+
+    for index, chunk in enumerate(chunks):
+        chunk.parent_context = "\n\n".join(
+            other.text for other in chunks[max(0, index - 1):min(len(chunks), index + 2)]
+        )
+    return chunks
+
+
 def ingest_document(
     file_path: str,
     doc_type: str = "policy",
@@ -220,29 +423,12 @@ def ingest_document(
     if not path.is_absolute():
         path = BASE_DIR / path
 
-    log.info("Partitioning document: %s", path)
-    if path.suffix.lower() == ".pdf":
-        reader = PdfReader(str(path))
-        raw_text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
-    else:
-        from unstructured.partition.auto import partition
-
-        elements = partition(filename=str(path), strategy=PARTITION_STRATEGY)
-        raw_text = "\n\n".join(
-            str(el) for el in elements
-            if el.category in {"NarrativeText", "Table", "ListItem", "Title"}
-        )
-
-    if not raw_text.strip():
-        raise ValueError(f"No usable text extracted from {path}")
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-    chunks = splitter.split_text(raw_text)
-    log.info("Split into %d chunks", len(chunks))
+    log.info("Partitioning document with structure awareness: %s", path)
+    blocks = _partition_document(path)
+    chunks = _build_structured_chunks(blocks)
+    if not chunks:
+        chunks = _fallback_recursive_chunks("\n\n".join(block.text for block in blocks))
+    log.info("Split into %d structure-aware chunks", len(chunks))
 
     ensure_policy_collection()
 
@@ -270,19 +456,22 @@ def ingest_document(
             id=point_id_for_chunk(path.name, i),
             vector={
                 qdrant.get_vector_field_name(): models.Document(
-                    text=chunk,
+                    text=chunk.text,
                     model=qdrant.embedding_model_name,
                 ),
                 qdrant.get_sparse_vector_field_name(): models.Document(
-                    text=chunk,
+                    text=chunk.text,
                     model=qdrant.sparse_embedding_model_name,
                 ),
             },
             payload={
                 **base_metadata,
-                "document": chunk,
+                "document": chunk.text,
                 "chunk_index": i,
-                "parent_context": "\n\n".join(chunks[max(0, i - 1):min(len(chunks), i + 2)]),
+                "parent_context": chunk.parent_context or chunk.text,
+                "section": chunk.section,
+                "element_categories": chunk.categories,
+                "block_indexes": chunk.block_indexes,
             },
         )
         for i, chunk in enumerate(chunks)
@@ -301,39 +490,145 @@ def ingest_document(
 # ─────────────────────────────────────────────
 # 5. RETRIEVAL — Hybrid + Rerank
 # ─────────────────────────────────────────────
+def generate_hyde_query(query: str) -> str:
+    """
+    Generate a hypothetical answer for dense retrieval. Sparse retrieval still
+    uses the original query so exact terms and identifiers are not diluted.
+    """
+    if not ENABLE_HYDE:
+        return query
+    try:
+        with trace_span("hyde_generation", run_type="llm", inputs={"query": query}, metadata={"model": HYDE_MODEL}):
+            response = llm.chat.completions.create(
+                model=HYDE_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Write a concise hypothetical helpdesk policy answer that would likely "
+                            "appear in the knowledge base. Do not invent order status, prices, or "
+                            "private customer details."
+                        ),
+                    },
+                    {"role": "user", "content": f"Customer question: {query}"},
+                ],
+                temperature=0.2,
+                max_tokens=HYDE_MAX_TOKENS,
+            )
+            record_llm_response("hyde", HYDE_MODEL, response)
+        hyde = (response.choices[0].message.content or "").strip()
+        return hyde or query
+    except Exception as e:
+        log.warning("HyDE generation failed (%s); using original query", e)
+        return query
+
+
+def compress_context(query: str, context: str) -> str:
+    """
+    Keep only query-relevant facts from a reranked parent context. Failure is
+    intentionally non-fatal because retrieval should still work without it.
+    """
+    if not ENABLE_CONTEXT_COMPRESSION:
+        return context
+    try:
+        with trace_span(
+            "context_compression",
+            run_type="llm",
+            inputs={"query": query, "context_chars": len(context)},
+            metadata={"model": COMPRESSION_MODEL},
+        ):
+            response = llm.chat.completions.create(
+                model=COMPRESSION_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Extract only the sentences or table/list rows from the context that "
+                            "help answer the question. Keep source wording when possible. "
+                            "If nothing is relevant, return EMPTY."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Question: {query}\n\nContext:\n{context}",
+                    },
+                ],
+                temperature=0,
+                max_tokens=260,
+            )
+            record_llm_response("compression", COMPRESSION_MODEL, response)
+        compressed = (response.choices[0].message.content or "").strip()
+        if not compressed or compressed.upper() == "EMPTY":
+            return context
+        return compressed
+    except Exception as e:
+        log.warning("Context compression failed (%s); using original context", e)
+        return context
+
+
+def _format_candidate(candidate: dict[str, Any], query: str) -> str:
+    context = candidate["parent_context"]
+    compressed_context = compress_context(query, context)
+    section = candidate.get("section")
+    source_line = f"Source: {candidate['source']} (chunk {candidate['chunk_index']})"
+    if section:
+        source_line += f"\nSection: {section}"
+    return f"{source_line}\n{compressed_context}"
+
+
 def retrieve(query: str, metadata_filter: Optional[dict[str, Any]] = None) -> list[str]:
     """
-    Hybrid search -> Cohere reranking -> top-N parent passages.
+    HyDE dense search + sparse keyword search -> RRF -> rerank -> compression.
     Small chunks are searched and reranked; larger neighboring context is sent
     to the answer model.
     """
     qdrant_filter = build_metadata_filter(metadata_filter)
-    dense_response = qdrant.query_points(
-        collection_name=COLLECTION_NAME,
-        query=models.Document(text=query, model=qdrant.embedding_model_name),
-        using=qdrant.get_vector_field_name(),
-        query_filter=qdrant_filter,
-        limit=RETRIEVAL_LIMIT,
-        with_payload=True,
-    )
-    sparse_response = qdrant.query_points(
-        collection_name=COLLECTION_NAME,
-        query=models.Document(text=query, model=qdrant.sparse_embedding_model_name),
-        using=qdrant.get_sparse_vector_field_name(),
-        query_filter=qdrant_filter,
-        limit=RETRIEVAL_LIMIT,
-        with_payload=True,
-    )
-    hits = reciprocal_rank_fusion(
-        [dense_response.points, sparse_response.points],
-        limit=RETRIEVAL_LIMIT,
-    )
+    dense_query = generate_hyde_query(query)
+    with trace_span(
+        "dense_retrieval",
+        run_type="retriever",
+        inputs={"query": dense_query, "limit": RETRIEVAL_LIMIT, "metadata_filter": metadata_filter or {}},
+        metadata={"collection": COLLECTION_NAME, "embedding_model": qdrant.embedding_model_name},
+    ):
+        dense_response = qdrant.query_points(
+            collection_name=COLLECTION_NAME,
+            query=models.Document(text=dense_query, model=qdrant.embedding_model_name),
+            using=qdrant.get_vector_field_name(),
+            query_filter=qdrant_filter,
+            limit=RETRIEVAL_LIMIT,
+            with_payload=True,
+        )
+    with trace_span(
+        "sparse_retrieval",
+        run_type="retriever",
+        inputs={"query": query, "limit": RETRIEVAL_LIMIT, "metadata_filter": metadata_filter or {}},
+        metadata={"collection": COLLECTION_NAME, "sparse_model": qdrant.sparse_embedding_model_name},
+    ):
+        sparse_response = qdrant.query_points(
+            collection_name=COLLECTION_NAME,
+            query=models.Document(text=query, model=qdrant.sparse_embedding_model_name),
+            using=qdrant.get_sparse_vector_field_name(),
+            query_filter=qdrant_filter,
+            limit=RETRIEVAL_LIMIT,
+            with_payload=True,
+        )
+    with trace_span(
+        "rrf_fusion",
+        run_type="chain",
+        inputs={"dense_hits": len(dense_response.points), "sparse_hits": len(sparse_response.points)},
+        metadata={"limit": RETRIEVAL_LIMIT},
+    ):
+        hits = reciprocal_rank_fusion(
+            [dense_response.points, sparse_response.points],
+            limit=RETRIEVAL_LIMIT,
+        )
     candidates = [
         {
             "document": h.payload.get("document", ""),
             "parent_context": h.payload.get("parent_context") or h.payload.get("document", ""),
             "source": h.payload.get("source", "unknown"),
             "chunk_index": h.payload.get("chunk_index", "unknown"),
+            "section": h.payload.get("section"),
         }
         for h in hits
         if h.payload and h.payload.get("document")
@@ -345,28 +640,27 @@ def retrieve(query: str, metadata_filter: Optional[dict[str, Any]] = None) -> li
     docs = [candidate["document"] for candidate in candidates]
     if co:
         try:
-            reranked = co.rerank(
-                query=query,
-                documents=docs,
-                model=RERANK_MODEL,
-                top_n=RERANK_TOP_N,
-            )
-            return [
-                (
-                    f"Source: {candidates[r.index]['source']} "
-                    f"(chunk {candidates[r.index]['chunk_index']})\n"
-                    f"{candidates[r.index]['parent_context']}"
+            with trace_span(
+                "reranking",
+                run_type="retriever",
+                inputs={"query": query, "candidate_count": len(docs)},
+                metadata={"model": RERANK_MODEL, "top_n": RERANK_TOP_N},
+            ):
+                reranked = co.rerank(
+                    query=query,
+                    documents=docs,
+                    model=RERANK_MODEL,
+                    top_n=RERANK_TOP_N,
                 )
+            return [
+                _format_candidate(candidates[r.index], query)
                 for r in reranked.results
             ]
         except Exception as e:
             log.warning("Cohere rerank failed (%s), using raw hits", e)
 
     return [
-        (
-            f"Source: {candidate['source']} (chunk {candidate['chunk_index']})\n"
-            f"{candidate['parent_context']}"
-        )
+        _format_candidate(candidate, query)
         for candidate in candidates[:RERANK_TOP_N]
     ]
 
@@ -392,17 +686,19 @@ def extract_order_id(text: str) -> Optional[str]:
 
     # LLM fallback
     try:
-        resp = llm.chat.completions.create(
-            model=FAST_LLM_MODEL,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Extract the order ID from this message. "
-                    f"Reply with ONLY the ID or 'NONE'.\n\nMessage: {text}"
-                )
-            }],
-            max_tokens=20,
-        )
+        with trace_span("order_id_extraction", run_type="llm", inputs={"text": text}, metadata={"model": FAST_LLM_MODEL}):
+            resp = llm.chat.completions.create(
+                model=FAST_LLM_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Extract the order ID from this message. "
+                        f"Reply with ONLY the ID or 'NONE'.\n\nMessage: {text}"
+                    )
+                }],
+                max_tokens=20,
+            )
+            record_llm_response("order_id_extraction", FAST_LLM_MODEL, resp)
         result = resp.choices[0].message.content.strip()
         return None if result.upper() == "NONE" else result
     except Exception as e:
@@ -530,16 +826,18 @@ def classify_intent(query: str, history_summary: str = "") -> IntentResult:
         "confidence must be a number between 0 and 1."
     )
     context = f"Conversation so far: {history_summary}\n\n" if history_summary else ""
-    resp = llm.chat.completions.create(
-        model=FAST_LLM_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": f"{context}User query: {query}"},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-        max_tokens=200,
-    )
+    with trace_span("intent_router", run_type="llm", inputs={"query": query}, metadata={"model": FAST_LLM_MODEL}):
+        resp = llm.chat.completions.create(
+            model=FAST_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": f"{context}User query: {query}"},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_tokens=200,
+        )
+        record_llm_response("router", FAST_LLM_MODEL, resp)
     content = resp.choices[0].message.content or "{}"
     return IntentResult(**json.loads(content))
 
@@ -565,12 +863,19 @@ def generate_answer(query: str, context: str, messages: list[dict]) -> str:
         "content": f"Reference context:\n{context}\n\nQuestion: {query}"
     })
 
-    resp = llm.chat.completions.create(
-        model=FINAL_LLM_MODEL,
-        messages=payload,
-        temperature=0.2,     # low temp for factual helpdesk responses
-        max_tokens=512,
-    )
+    with trace_span(
+        "final_answer_generation",
+        run_type="llm",
+        inputs={"query": query, "context_chars": len(context)},
+        metadata={"model": FINAL_LLM_MODEL},
+    ):
+        resp = llm.chat.completions.create(
+            model=FINAL_LLM_MODEL,
+            messages=payload,
+            temperature=0.2,     # low temp for factual helpdesk responses
+            max_tokens=512,
+        )
+        record_llm_response("final_answer", FINAL_LLM_MODEL, resp)
     return resp.choices[0].message.content.strip()
 
 
@@ -580,30 +885,37 @@ def critique_answer(query: str, context: str, answer: str) -> CriticResult:
     Second-pass faithfulness check. The critic must reject answers that add
     policy claims not supported by the retrieved context.
     """
-    resp = llm.chat.completions.create(
-        model=FAST_LLM_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a strict RAG faithfulness critic. Decide whether the answer is "
-                    "fully supported by the reference context. Return only JSON with keys "
-                    "supported and reason."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Reference context:\n{context}\n\n"
-                    f"Question: {query}\n\n"
-                    f"Answer: {answer}"
-                ),
-            },
-        ],
-        response_format={"type": "json_object"},
-        temperature=0,
-        max_tokens=160,
-    )
+    with trace_span(
+        "answer_critic",
+        run_type="llm",
+        inputs={"query": query, "answer": answer},
+        metadata={"model": FAST_LLM_MODEL},
+    ):
+        resp = llm.chat.completions.create(
+            model=FAST_LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict RAG faithfulness critic. Decide whether the answer is "
+                        "fully supported by the reference context. Return only JSON with keys "
+                        "supported and reason."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Reference context:\n{context}\n\n"
+                        f"Question: {query}\n\n"
+                        f"Answer: {answer}"
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=160,
+        )
+        record_llm_response("critic", FAST_LLM_MODEL, resp)
     content = resp.choices[0].message.content or "{}"
     return CriticResult(**json.loads(content))
 
@@ -630,6 +942,7 @@ def generate_verified_answer(query: str, context: str, messages: list[dict]) -> 
 class Session:
     """Holds per-user conversation state."""
     messages: list[dict] = field(default_factory=list)
+    usage_reports: list[dict[str, Any]] = field(default_factory=list)
 
     def add(self, role: str, content: str):
         self.messages.append({"role": role, "content": content})
@@ -641,12 +954,23 @@ class Session:
 
     def clear(self):
         self.messages.clear()
+        self.usage_reports.clear()
 
 
 # ─────────────────────────────────────────────
 # 11. MAIN AGENT LOOP
 # ─────────────────────────────────────────────
 def agent_loop(user_query: str, session: Session) -> str:
+    with usage_run("agent_query"):
+        with trace_span("agent_query", inputs={"query": user_query}, metadata={"history_turns": len(session.messages)}):
+            reply = _agent_loop_impl(user_query, session)
+        usage_report = current_usage_report()
+        if usage_report:
+            session.usage_reports.append(usage_report)
+        return reply
+
+
+def _agent_loop_impl(user_query: str, session: Session) -> str:
     """
     Full production agent loop:
       1. Classify intent (structured)
