@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from pydantic import BaseModel
 
 from Rag_Agent import (
     FAST_LLM_MODEL,
+    FINAL_LLM_MODEL,
     LLM_BASE_URL,
     QDRANT_URL,
     extract_metadata_filter,
@@ -80,6 +82,30 @@ def rouge_l_f1(candidate: str, reference: str) -> float:
     return (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
 
 
+def coerce_score(value: Any) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(score):
+        return 0.0
+    return max(0.0, min(1.0, score))
+
+
+def parse_evaluation_result(content: str) -> EvaluationResult:
+    payload = json.loads(content or "{}")
+    reason = payload.get("reason", "")
+    if not isinstance(reason, str):
+        reason = json.dumps(reason, ensure_ascii=False)
+    return EvaluationResult(
+        faithfulness=coerce_score(payload.get("faithfulness")),
+        answer_relevancy=coerce_score(payload.get("answer_relevancy")),
+        context_precision=coerce_score(payload.get("context_precision")),
+        context_recall=coerce_score(payload.get("context_recall")),
+        reason=reason,
+    )
+
+
 def judge_case(
     question: str,
     expected: str,
@@ -109,7 +135,7 @@ def judge_case(
         max_tokens=200,
     )
     record_llm_response("evaluator", FAST_LLM_MODEL, response)
-    return EvaluationResult(**json.loads(response.choices[0].message.content or "{}"))
+    return parse_evaluation_result(response.choices[0].message.content or "{}")
 
 
 def average(values: list[float]) -> float:
@@ -237,13 +263,27 @@ def finite_float(value: Any) -> float | None:
     return numeric if math.isfinite(numeric) else None
 
 
-def run_ragas(case_reports: list[dict[str, Any]], model: str) -> dict[str, Any]:
+def ragas_case_payload(case: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "question": case["question"],
+        "answer": case["generated_answer"],
+        "contexts": case["passages"],
+        "ground_truth": case["golden_answer"],
+        "user_input": case["question"],
+        "response": case["generated_answer"],
+        "retrieved_contexts": case["passages"],
+        "reference": case["golden_answer"],
+    }
+
+
+def run_ragas(case_reports: list[dict[str, Any]], model: str, sleep_seconds: float = 65.0) -> dict[str, Any]:
     """
     Optional RAGAS pass. All imports live inside this function so the lightweight
     evaluator and dashboard still work without the heavier optional packages.
     """
     try:
         from datasets import Dataset
+        from ragas.run_config import RunConfig
         from langchain_groq import ChatGroq
 
         evaluate, metrics = _ragas_metric_imports()
@@ -251,28 +291,25 @@ def run_ragas(case_reports: list[dict[str, Any]], model: str) -> dict[str, Any]:
         return {"enabled": False, "status": "unavailable", "error": str(e), "summary": {}, "cases": []}
 
     try:
-        dataset = Dataset.from_list(
-            [
-                {
-                    "question": case["question"],
-                    "answer": case["generated_answer"],
-                    "contexts": case["passages"],
-                    "ground_truth": case["golden_answer"],
-                    "user_input": case["question"],
-                    "response": case["generated_answer"],
-                    "retrieved_contexts": case["passages"],
-                    "reference": case["golden_answer"],
-                }
-                for case in case_reports
-            ]
-        )
-        result = evaluate(
-            dataset,
-            metrics=metrics,
-            llm=_groq_chat_model(ChatGroq, model),
-            embeddings=_ragas_embeddings(),
-        )
-        rows = result.to_pandas().to_dict(orient="records")
+        rows: list[dict[str, Any]] = []
+        ragas_llm = _groq_chat_model(ChatGroq, model)
+        ragas_embeddings = _ragas_embeddings()
+        run_config = RunConfig(timeout=180, max_retries=2, max_wait=60, max_workers=1)
+        for index, case in enumerate(case_reports, start=1):
+            dataset = Dataset.from_list([ragas_case_payload(case)])
+            result = evaluate(
+                dataset,
+                metrics=metrics,
+                llm=ragas_llm,
+                embeddings=ragas_embeddings,
+                run_config=run_config,
+                batch_size=1,
+                raise_exceptions=False,
+            )
+            rows.extend(result.to_pandas().to_dict(orient="records"))
+            print(f"ragas {index}/{len(case_reports)} complete")
+            if index < len(case_reports) and sleep_seconds > 0:
+                time.sleep(sleep_seconds)
         summary: dict[str, float] = {}
         for key in ("faithfulness", "answer_relevancy", "context_precision", "context_recall"):
             values = [
@@ -332,12 +369,32 @@ def main() -> None:
     )
     parser.add_argument(
         "--ragas-model",
-        default=os.getenv("RAGAS_MODEL", FAST_LLM_MODEL),
+        default=os.getenv("RAGAS_MODEL", FINAL_LLM_MODEL),
         help="Groq model to use for optional RAGAS judge calls.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Evaluate only the first N cases. Use 0 for all cases.",
+    )
+    parser.add_argument(
+        "--case-sleep",
+        type=float,
+        default=float(os.getenv("EVAL_CASE_SLEEP_SECONDS", "30")),
+        help="Seconds to sleep between local evaluator cases to respect API rate limits.",
+    )
+    parser.add_argument(
+        "--ragas-sleep",
+        type=float,
+        default=float(os.getenv("RAGAS_CASE_SLEEP_SECONDS", "65")),
+        help="Seconds to sleep between one-case RAGAS evaluations.",
     )
     args = parser.parse_args()
 
     cases = json.loads(args.test_set.read_text(encoding="utf-8-sig"))
+    if args.limit > 0:
+        cases = cases[:args.limit]
     case_reports: list[dict[str, Any]] = []
 
     for index, case in enumerate(cases, start=1):
@@ -384,10 +441,12 @@ def main() -> None:
             f"context_recall={metrics['context_recall']:.2f} "
             f"rouge_l={metrics['rouge_l']:.2f} - {result.reason}"
         )
+        if index < len(cases) and args.case_sleep > 0:
+            time.sleep(args.case_sleep)
 
     summary = summarize_cases(case_reports)
     usage_summary = summarize_usage(case_reports)
-    ragas_report = run_ragas(case_reports, args.ragas_model) if args.ragas else {
+    ragas_report = run_ragas(case_reports, args.ragas_model, args.ragas_sleep) if args.ragas else {
         "enabled": False,
         "status": "not_requested",
         "error": "",
@@ -399,9 +458,13 @@ def main() -> None:
         "run_id": run_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "test_set": str(args.test_set),
+        "case_limit": args.limit or None,
+        "case_sleep_seconds": args.case_sleep,
         "retrieval_only": args.retrieval_only,
         "qdrant_url": QDRANT_URL,
         "judge_model": FAST_LLM_MODEL,
+        "ragas_model": args.ragas_model if args.ragas else None,
+        "ragas_sleep_seconds": args.ragas_sleep if args.ragas else None,
         "ragas": ragas_report,
         "summary": summary,
         "usage": usage_summary,

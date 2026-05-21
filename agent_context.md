@@ -10,12 +10,15 @@ This is a small AI helpdesk/RAG demo. It combines:
 - Local Qdrant vector search through Docker
 - A mock FastAPI order-status service in `orders_api/`
 - `.env` based secret loading for API keys
+- Optional LangSmith tracing, token usage, and cost accounting through `observability.py`
+- RAG evaluation reports and a local Streamlit dashboard
 
 The intended demo flow is:
 
 1. Start Qdrant and the orders API with Docker Compose.
 2. Run the Python agent locally.
-3. The agent routes customer messages to either order lookup or policy/RAG answers.
+3. The demo runner ingests `Store_Return_Policy.pdf` into Qdrant.
+4. The agent routes customer messages to either order lookup or policy/RAG answers.
 
 ## Current Repository State
 
@@ -31,7 +34,7 @@ Branch:
 
 `main`
 
-The repository has an initial project commit and a Groq/environment refactor commit.
+The repository has commits for the initial project setup, Groq/environment refactor, orders API, RAG quality improvements, and observability/reporting features.
 
 ## Important Files
 
@@ -41,8 +44,14 @@ The repository has an initial project commit and a Groq/environment refactor com
 - `orders_api/Dockerfile` - container for the orders API.
 - `orders_api/requirements.txt` - container dependencies for the orders API.
 - `requirements.txt` - local Python dependencies for the RAG agent.
+- `Store_Return_Policy.pdf` - sample policy PDF used by the demo ingestion path.
+- `observability.py` - optional LangSmith tracing plus per-stage token and cost tracking.
 - `evaluate_rag.py` - lightweight RAG evaluator for retrieval and generated-answer quality.
 - `synthesize_eval_set.py` - synthetic eval-set generator from the policy PDF.
+- `rag_dashboard.py` - Streamlit dashboard for timestamped reports in `reports/`.
+- `reports/` - generated evaluator output directory, ignored by Git.
+- `qdrant_storage/` - generated local Qdrant storage directory, ignored by Git.
+- `spec_sheet.md` - project/spec notes for the helpdesk demo.
 - `.env.example` - sample environment variables.
 - `.gitignore` - excludes local secrets, virtualenvs, caches, and Qdrant storage.
 - `README.md` - human-readable project overview and setup guide.
@@ -59,6 +68,7 @@ The repository has an initial project commit and a Groq/environment refactor com
 - The orders API container has its own small `orders_api/requirements.txt`.
 - Updated `Rag_Agent.py` to:
   - load `.env` with `python-dotenv`
+  - use only `.env` / process environment variables for config; Colab `userdata` support was removed to keep local code simple
   - default Qdrant to `http://localhost:6333`
   - use FastEmbed dense model `BAAI/bge-small-en-v1.5` and sparse model `Qdrant/bm25`
   - default order API to `http://localhost:8000`
@@ -77,17 +87,28 @@ The repository has an initial project commit and a Groq/environment refactor com
   - deterministic pre-LLM guardrails for obvious sensitive or abusive input
   - metadata-aware retrieval filters for fields such as `year` and `type`
   - small-to-big retrieval by reranking small chunks and feeding neighboring `parent_context`
+  - HyDE dense retrieval using the fast Groq model while sparse/BM25 retrieval keeps the original query
+  - contextual compression using the fast Groq model before final answer generation
   - a critic pass that rejects unsupported policy answers
   - `evaluate_rag.py` for repeatable faithfulness, answer-relevancy, context precision/recall, and ROUGE-L scoring against golden answers
   - `synthesize_eval_set.py` for generating 50+ diverse eval cases from the PDF
+- Added observability and reporting:
+  - `observability.py` records LLM usage by stage and computes optional cost from `GROQ_MODEL_PRICES_JSON`
+  - optional LangSmith spans are enabled only when `ENABLE_LANGSMITH=true` and `LANGSMITH_API_KEY` is set
+  - `evaluate_rag.py` writes timestamped JSON reports under `reports/` by default
+  - optional RAGAS metrics run through `python evaluate_rag.py .\rag_eval_set.json --ragas`
+  - `rag_dashboard.py` displays latest scores, trends, low-scoring cases, generated answers, golden answers, retrieved context, token usage, and partial cost data
 - Left durable memory and async/concurrent serving in future scope; `Session` remains intentionally in-memory for this demo.
 - Added `.env.example`, `.gitignore`, and `requirements.txt`.
-- Syntax check passed using the bundled Codex Python runtime because `python` and `py` were not available on PATH.
+- Current local verification caveat: the checked-in `venv` can point to a missing Python install, and `python` / `py` may not be available on PATH. Use a fresh Python 3.11 virtualenv or the bundled Codex runtime path below when verifying.
 
 ## Notes For Future Agents
 
 - Do not commit `.env`.
 - Prefer local Qdrant at `http://localhost:6333` unless the user explicitly wants Qdrant Cloud.
+- Add `QDRANT_API_KEY` only for Qdrant Cloud; local Docker Qdrant does not need it.
+- The project no longer uses `google.colab` or Colab `userdata`; keep config local-first through `.env`.
+- Generated `reports/` and `qdrant_storage/` are intentionally ignored by Git.
 - `Rag_Agent.py` intentionally contains a few Unicode separators and arrows in comments/output labels.
 - Use small targeted patches for `Rag_Agent.py`; exact comment text may be hard to match.
 - There should be only one Dockerfile, at `orders_api/Dockerfile`.

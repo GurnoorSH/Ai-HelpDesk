@@ -14,11 +14,11 @@ Architecture:
 """
 
 # ─────────────────────────────────────────────
-# 1. INSTALL (run once in Colab)
+# 1. INSTALL (run once locally)
 # ─────────────────────────────────────────────
-# !apt-get install -y libmagic-dev poppler-utils tesseract-ocr
-# !pip install -U "unstructured[all-docs]" qdrant-client[fastembed] \
-#     openai cohere langchain-text-splitters pydantic tenacity requests python-dotenv
+# System packages may be required for PDF/OCR parsing on some platforms:
+# libmagic-dev poppler-utils tesseract-ocr
+# Python dependencies are listed in requirements.txt.
 
 # ─────────────────────────────────────────────
 # 2. IMPORTS & CONFIG
@@ -45,6 +45,8 @@ import cohere
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+load_dotenv()
+
 from observability import (
     current_usage_report,
     record_llm_response,
@@ -61,29 +63,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
-load_dotenv()
-
-# ── Credentials (Colab) ──────────────────────
-try:
-    from google.colab import userdata
-    GROQ_API_KEY    = userdata.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
-    COHERE_API_KEY  = userdata.get("COHERE_API_KEY") or os.getenv("COHERE_API_KEY")
-    QDRANT_URL      = userdata.get("QDRANT_URL") or os.getenv("QDRANT_URL", "http://localhost:6333")
-    QDRANT_API_KEY  = userdata.get("QDRANT_API_KEY") or os.getenv("QDRANT_API_KEY")
-    ORDER_API_URL   = userdata.get("ORDER_API_URL") or os.getenv("ORDER_API_URL", "http://localhost:8000")
-    LLM_BASE_URL    = userdata.get("LLM_BASE_URL") or os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
-    FAST_LLM_MODEL  = userdata.get("FAST_LLM_MODEL") or os.getenv("FAST_LLM_MODEL", "llama-3.1-8b-instant")
-    FINAL_LLM_MODEL = userdata.get("FINAL_LLM_MODEL") or os.getenv("FINAL_LLM_MODEL", "llama-3.3-70b-versatile")
-except Exception:
-    # Fallback to environment variables (local / CI)
-    GROQ_API_KEY    = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
-    COHERE_API_KEY  = os.getenv("COHERE_API_KEY")
-    QDRANT_URL      = os.getenv("QDRANT_URL", "http://localhost:6333")
-    QDRANT_API_KEY  = os.getenv("QDRANT_API_KEY")
-    ORDER_API_URL   = os.getenv("ORDER_API_URL", "http://localhost:8000")
-    LLM_BASE_URL    = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
-    FAST_LLM_MODEL  = os.getenv("FAST_LLM_MODEL", "llama-3.1-8b-instant")
-    FINAL_LLM_MODEL = os.getenv("FINAL_LLM_MODEL", "llama-3.3-70b-versatile")
+# ── Credentials ──────────────────────
+GROQ_API_KEY    = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
+COHERE_API_KEY  = os.getenv("COHERE_API_KEY")
+QDRANT_URL      = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY  = os.getenv("QDRANT_API_KEY")
+ORDER_API_URL   = os.getenv("ORDER_API_URL", "http://localhost:8000")
+LLM_BASE_URL    = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+FAST_LLM_MODEL  = os.getenv("FAST_LLM_MODEL", "llama-3.1-8b-instant")
+FINAL_LLM_MODEL = os.getenv("FINAL_LLM_MODEL", "llama-3.3-70b-versatile")
 
 COLLECTION_NAME  = "helpdesk_policy"
 BASE_DIR         = Path(__file__).resolve().parent

@@ -6,6 +6,7 @@ Run with:
 """
 
 import json
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,110 @@ METRIC_KEYS = [
     "context_recall",
     "rouge_l",
 ]
+
+
+def apply_theme() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --dashboard-border: rgba(148, 163, 184, 0.32);
+            --dashboard-muted: rgba(100, 116, 139, 0.96);
+            --dashboard-card-bg: var(--secondary-background-color);
+            --dashboard-text: var(--text-color);
+            --dashboard-label: rgba(100, 116, 139, 0.98);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --dashboard-border: rgba(148, 163, 184, 0.24);
+                --dashboard-muted: rgba(203, 213, 225, 0.82);
+                --dashboard-label: rgba(203, 213, 225, 0.88);
+            }
+        }
+
+        .block-container {
+            max-width: 1380px;
+            padding-top: 3rem;
+            padding-bottom: 4rem;
+        }
+
+        [data-testid="stSidebar"] {
+            border-right: 1px solid var(--dashboard-border);
+        }
+
+        .dashboard-header {
+            border-bottom: 1px solid var(--dashboard-border);
+            margin-bottom: 1.6rem;
+            padding-bottom: 1.2rem;
+        }
+
+        .dashboard-kicker {
+            color: var(--dashboard-muted);
+            font-size: 0.82rem;
+            font-weight: 650;
+            letter-spacing: 0;
+            margin: 0 0 0.35rem;
+        }
+
+        .dashboard-title {
+            color: var(--dashboard-text);
+            font-size: 2.15rem;
+            font-weight: 720;
+            line-height: 1.18;
+            letter-spacing: 0;
+            margin: 0;
+        }
+
+        .dashboard-meta {
+            color: var(--dashboard-muted);
+            font-size: 0.94rem;
+            line-height: 1.55;
+            margin-top: 0.7rem;
+            overflow-wrap: anywhere;
+        }
+
+        .section-label {
+            color: var(--dashboard-text);
+            font-size: 1.05rem;
+            font-weight: 700;
+            letter-spacing: 0;
+            margin: 1.8rem 0 0.7rem;
+        }
+
+        [data-testid="stMetric"] {
+            background: var(--dashboard-card-bg);
+            border: 1px solid var(--dashboard-border);
+            border-radius: 8px;
+            min-height: 112px;
+            padding: 1rem 1.1rem;
+        }
+
+        [data-testid="stMetricLabel"] p {
+            color: var(--dashboard-label);
+            font-size: 0.86rem;
+        }
+
+        [data-testid="stMetricValue"] {
+            color: var(--dashboard-text);
+            font-size: 1.55rem;
+        }
+
+        [data-testid="stMetricDelta"] {
+            font-size: 0.86rem;
+        }
+
+        div[data-testid="stVerticalBlock"] > div:has(> [data-testid="stHorizontalBlock"]) {
+            gap: 0.9rem;
+        }
+
+        .stAlert {
+            margin-top: 0.9rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def load_reports(reports_dir: Path = REPORTS_DIR) -> list[dict[str, Any]]:
@@ -97,10 +202,19 @@ def metric_delta(current: dict[str, Any], previous: dict[str, Any] | None, key: 
 
 def main() -> None:
     st.set_page_config(page_title="RAG Eval Dashboard", layout="wide")
-    st.title("RAG Eval Dashboard")
+    apply_theme()
 
     reports = load_reports()
     if not reports:
+        st.markdown(
+            """
+            <div class="dashboard-header">
+              <p class="dashboard-kicker">Local RAG Evaluation</p>
+              <h1 class="dashboard-title">RAG Eval Dashboard</h1>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         st.info("No reports found. Run `python evaluate_rag.py .\\rag_eval_set.json` first.")
         return
 
@@ -113,11 +227,26 @@ def main() -> None:
     selected_index = df.index[df["run_id"] == selected_run][0]
     report = reports[int(selected_index)]
     previous_report = reports[int(selected_index) + 1] if int(selected_index) + 1 < len(reports) else None
+    report_path = escape(str(report.get("_path", "")))
+    selected_run_label = escape(str(selected_run))
 
-    st.caption(f"Report: `{report.get('_path', '')}`")
+    st.markdown(
+        f"""
+        <div class="dashboard-header">
+          <p class="dashboard-kicker">Local RAG Evaluation</p>
+          <h1 class="dashboard-title">RAG Eval Dashboard</h1>
+          <div class="dashboard-meta">
+            <strong>{selected_run_label}</strong><br>
+            {report_path}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     usage = report.get("usage", {})
-    usage_cols = st.columns(4)
+    st.markdown('<div class="section-label">Run Usage</div>', unsafe_allow_html=True)
+    usage_cols = st.columns(4, gap="large")
     usage_cols[0].metric("Eval Tokens", f"{int(usage.get('total_tokens') or 0):,}")
     usage_cols[1].metric("Input Tokens", f"{int(usage.get('total_input_tokens') or 0):,}")
     usage_cols[2].metric("Output Tokens", f"{int(usage.get('total_output_tokens') or 0):,}")
@@ -129,7 +258,8 @@ def main() -> None:
             + ", ".join(sorted(set(unknown_stages)))
         )
 
-    cols = st.columns(len(METRIC_KEYS))
+    st.markdown('<div class="section-label">Quality Scores</div>', unsafe_allow_html=True)
+    cols = st.columns(len(METRIC_KEYS), gap="large")
     for col, key in zip(cols, METRIC_KEYS):
         value = report.get("summary", {}).get(key, 0.0)
         delta = metric_delta(report, previous_report, key)
@@ -138,12 +268,13 @@ def main() -> None:
     ragas = report.get("ragas", {})
     if ragas.get("status") == "ok":
         st.success("RAGAS metrics available for this run.")
-        ragas_cols = st.columns(4)
+        ragas_cols = st.columns(4, gap="large")
         for col, key in zip(ragas_cols, ("faithfulness", "answer_relevancy", "context_precision", "context_recall")):
             col.metric(f"RAGAS {key.replace('_', ' ').title()}", f"{float(ragas['summary'].get(key, 0.0)):.2f}")
     elif ragas.get("status") not in {None, "not_requested"}:
         st.warning(f"RAGAS status: {ragas.get('status')} - {ragas.get('error', '')}")
 
+    st.divider()
     st.subheader("Trends")
     trend_df = df.sort_values("created_at")
     st.line_chart(trend_df.set_index("run_id")[METRIC_KEYS])
@@ -165,7 +296,7 @@ def main() -> None:
     )
     case = next(item for item in report.get("cases", []) if item.get("index") == selected_case)
 
-    left, right = st.columns(2)
+    left, right = st.columns(2, gap="large")
     with left:
         st.markdown("**Question**")
         st.write(case.get("question", ""))

@@ -16,6 +16,7 @@ The output schema is compatible with evaluate_rag.py:
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -39,7 +40,8 @@ def extract_pdf_text(path: Path) -> str:
     return "\n\n".join(page.extract_text() or "" for page in reader.pages).strip()
 
 
-def synthesize_cases(policy_text: str, count: int) -> list[dict]:
+def synthesize_case_batch(policy_text: str, count: int, batch_number: int) -> list[dict]:
+    policy_excerpt = policy_text[:8000]
     prompt = (
         f"Generate {count} diverse RAG evaluation cases from this store policy text. "
         "Return only JSON with a top-level key named cases.\n\n"
@@ -51,14 +53,15 @@ def synthesize_cases(policy_text: str, count: int) -> list[dict]:
         "- Keep golden_answer concise and customer-facing.\n"
         "- expected should be a short list of required facts, not prose.\n"
         "- tags should be short strings like returns, refunds, electronics, no_answer, multi_part.\n\n"
-        f"Policy text:\n{policy_text[:24000]}"
+        f"Batch number: {batch_number}\n"
+        f"Policy text:\n{policy_excerpt}"
     )
     response = llm.chat.completions.create(
         model=FAST_LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
         temperature=0.3,
-        max_tokens=6000,
+        max_tokens=min(3200, 700 + count * 240),
     )
     payload = json.loads(response.choices[0].message.content or "{}")
     cases = payload.get("cases", [])
@@ -67,9 +70,34 @@ def synthesize_cases(policy_text: str, count: int) -> list[dict]:
     return cases[:count]
 
 
+def synthesize_cases(policy_text: str, count: int, batch_size: int, sleep_seconds: float) -> list[dict]:
+    cases: list[dict] = []
+    batch_number = 1
+    while len(cases) < count:
+        remaining = count - len(cases)
+        current_batch_size = min(batch_size, remaining)
+        cases.extend(synthesize_case_batch(policy_text, current_batch_size, batch_number))
+        batch_number += 1
+        if len(cases) < count and sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+    return cases[:count]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate synthetic RAG evaluation cases.")
     parser.add_argument("--count", type=int, default=50, help="Number of cases to generate.")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=int(os.getenv("SYNTH_EVAL_BATCH_SIZE", "5")),
+        help="Cases to generate per Groq call. Keep low for small TPM limits.",
+    )
+    parser.add_argument(
+        "--batch-sleep",
+        type=float,
+        default=float(os.getenv("SYNTH_EVAL_BATCH_SLEEP_SECONDS", "65")),
+        help="Seconds to sleep between generation batches.",
+    )
     parser.add_argument("--policy", type=Path, default=POLICY_DOC_PATH, help="Policy PDF path.")
     parser.add_argument(
         "--output",
@@ -84,7 +112,7 @@ def main() -> None:
     if not policy_text:
         raise ValueError(f"No text could be extracted from {policy_path}")
 
-    cases = synthesize_cases(policy_text, args.count)
+    cases = synthesize_cases(policy_text, args.count, args.batch_size, args.batch_sleep)
     args.output.write_text(json.dumps(cases, indent=2), encoding="utf-8")
     print(f"Wrote {len(cases)} cases to {args.output}")
 

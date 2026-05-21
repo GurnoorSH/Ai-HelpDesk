@@ -6,12 +6,18 @@ A small AI helpdesk demo that routes customer support questions to either:
 - a RAG pipeline backed by Qdrant for policy/helpdesk questions
 
 It is built for local demos and recordings: Qdrant and the mock order API run in Docker, while the main agent runs as a Python script.
+Configuration is local-first: secrets and model settings come from `.env` / environment variables, not notebook or Colab helpers.
 
 ## What Is Inside
 
 - `Rag_Agent.py` - main helpdesk agent with intent routing, retrieval, reranking, and answer generation.
 - `evaluate_rag.py` - lightweight RAG evaluator for retrieval and generated-answer quality.
 - `synthesize_eval_set.py` - creates a synthetic eval set from the policy PDF.
+- `observability.py` - optional LangSmith tracing plus per-stage token and cost accounting.
+- `rag_dashboard.py` - Streamlit dashboard for saved evaluation reports.
+- `Store_Return_Policy.pdf` - sample policy document ingested into Qdrant by the demo runner.
+- `reports/` - generated evaluation reports, ignored by Git.
+- `qdrant_storage/` - generated local Qdrant data, ignored by Git.
 - `orders_api/` - a FastAPI mock order service.
 - `docker-compose.yml` - starts Qdrant and the orders API.
 - `requirements.txt` - Python dependencies for the local agent.
@@ -78,11 +84,12 @@ SEMANTIC_BREAK_THRESHOLD=0.70
 ENABLE_LANGSMITH=false
 LANGSMITH_API_KEY=
 LANGSMITH_PROJECT=ai-helpdesk-rag
-GROQ_MODEL_PRICES_JSON={}
+GROQ_MODEL_PRICES_JSON={"llama-3.1-8b-instant":{"input_per_1m":0.05,"output_per_1m":0.08},"llama-3.3-70b-versatile":{"input_per_1m":0.59,"output_per_1m":0.79}}
 ```
 
 The agent uses `FAST_LLM_MODEL` for routing and order ID extraction, and `FINAL_LLM_MODEL` for final customer-facing answers.
 `POLICY_DOC_PATH` points to the PDF that should be ingested into Qdrant.
+`QDRANT_URL` defaults to local Docker Qdrant. Add `QDRANT_API_KEY` in `.env` only if you are connecting to Qdrant Cloud.
 `UNSTRUCTURED_STRATEGY=fast` keeps PDF ingestion lightweight for normal text PDFs. Use `hi_res` only if you install the extra OCR/inference dependencies.
 `ENABLE_HYDE` uses a Groq fast model to generate a hypothetical answer for dense retrieval while sparse/BM25 search still uses the original query.
 `ENABLE_CONTEXT_COMPRESSION` uses a Groq fast model to trim reranked parent context before final answer generation.
@@ -134,6 +141,7 @@ python Rag_Agent.py
 ```
 
 The demo runner sends a few sample queries through the agent, including order tracking and policy-style questions.
+At startup, the runner ingests `POLICY_DOC_PATH` into the `helpdesk_policy` Qdrant collection, then executes the sample turns.
 
 ## RAG Quality And Guardrails
 
@@ -161,26 +169,44 @@ You can create a small JSON test set and run retrieval evaluation:
 ]
 ```
 
-For more thorough testing, generate a larger synthetic set from the PDF:
+For more thorough testing, generate a larger synthetic set from the PDF. The generator batches requests by default so it stays under Groq's smaller on-demand token limits:
 
 ```powershell
-python synthesize_eval_set.py --count 50 --output .\rag_eval_set.synthetic.json
+python synthesize_eval_set.py --count 50 --batch-size 5 --batch-sleep 65 --output .\rag_eval_set.synthetic.json
 ```
 
-Aim for 50-100 cases before treating the score as production signal. The set should include normal questions, no-answer questions, ambiguous phrasing, and multi-part questions.
+Aim for 50-100 cases before treating the score as production signal. The set should include normal questions, no-answer questions, ambiguous phrasing, and multi-part questions. Review generated `golden_answer` values before using the set for serious benchmarking.
+
+If the Qdrant collection was deleted or reset, ingest the policy PDF before running evaluation:
 
 ```powershell
-python evaluate_rag.py .\rag_eval_set.json
+python -c "from Rag_Agent import POLICY_DOC_PATH, ingest_document; ingest_document(POLICY_DOC_PATH, doc_type='policy')"
+```
+
+You do not need to separately run `python Rag_Agent.py` for evaluation. `evaluate_rag.py` imports the RAG functions and triggers retrieval, answer generation, judging, and report writing itself.
+
+For a quick smoke test with RAGAS:
+
+```powershell
+python evaluate_rag.py .\rag_eval_set.synthetic.json --ragas --limit 2 --case-sleep 30 --ragas-sleep 65
+```
+
+For the fuller 50-case report with RAGAS:
+
+```powershell
+python evaluate_rag.py .\rag_eval_set.synthetic.json --ragas --case-sleep 30 --ragas-sleep 65
 ```
 
 Each evaluation writes a timestamped JSON report under `reports/` unless you pass `--no-report`.
-To add optional RAGAS metrics, install the full requirements and run:
+RAGAS and the local evaluator can make many Groq calls. On Groq on-demand limits such as 30 requests/minute and about 6.5k tokens/minute for `llama-3.1-8b-instant`, keep `--case-sleep` and `--ragas-sleep` enabled. A 50-case RAGAS run can take more than an hour.
+
+To run the lightweight evaluator without RAGAS:
 
 ```powershell
-python evaluate_rag.py .\rag_eval_set.json --ragas
+python evaluate_rag.py .\rag_eval_set.synthetic.json --case-sleep 30
 ```
 
-RAGAS uses a Groq judge model through `langchain-groq` and local FastEmbed embeddings for embedding-based metrics. If the optional RAGAS dependencies or calls fail, the lightweight evaluator still finishes and records the RAGAS error in the report.
+RAGAS uses a Groq judge model through `langchain-groq` and local FastEmbed embeddings for embedding-based metrics. It runs one eval case at a time in this project to reduce rate-limit spikes. If optional RAGAS dependencies or calls fail, the lightweight evaluator still finishes and records the RAGAS error in the report.
 
 The evaluator reports:
 
@@ -220,6 +246,7 @@ docker compose down
 ## Notes
 
 The policy/RAG path expects documents to be ingested into Qdrant before it can answer policy questions. The order-status path can work immediately once Docker Compose is running.
+The current demo runner calls `ingest_document(POLICY_DOC_PATH, doc_type="policy")` automatically; if you later wrap the agent in an API, make ingestion a startup/admin step instead of doing it per request.
 
 Do not commit your `.env` file. It contains secrets and is already ignored by Git.
 

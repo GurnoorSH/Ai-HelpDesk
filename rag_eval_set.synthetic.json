@@ -1,0 +1,688 @@
+[
+  {
+    "question": "Can I return a laptop after 30 days?",
+    "expected": [
+      "return window",
+      "electronic item",
+      "30 days"
+    ],
+    "golden_answer": "No, due to the restricted return window for electronics.",
+    "tags": [
+      "electronics",
+      "return window",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "What is the return window for a non-electronic item?",
+    "expected": [
+      "return window",
+      "non-electronic item",
+      "30 days"
+    ],
+    "golden_answer": "You can return most items within 30 days of delivery.",
+    "tags": [
+      "returns",
+      "general"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a personalized item?",
+    "expected": [
+      "return policy",
+      "personalized item"
+    ],
+    "golden_answer": "No, personalized items cannot be returned.",
+    "tags": [
+      "returns",
+      "non-returnable",
+      "personalized"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "What happens if I return an item after 60 days?",
+    "expected": [
+      "return window",
+      "late return"
+    ],
+    "golden_answer": "Unfortunately, we cannot accept returns after 60 days.",
+    "tags": [
+      "returns",
+      "late returns",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "How long does it take to process a refund?",
+    "expected": [
+      "refund process",
+      "timeframe"
+    ],
+    "golden_answer": "Please allow 5-7 business days for inspection and refund.",
+    "tags": [
+      "refunds",
+      "refund process"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a damaged item for a full refund?",
+    "expected": [
+      "refund process",
+      "damaged item"
+    ],
+    "golden_answer": "Refunds will be credited back to the original payment method, but shipping costs are non-refundable.",
+    "tags": [
+      "returns",
+      "refund process",
+      "damaged item"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "What items are not eligible for return?",
+    "expected": [
+      "non-returnable items",
+      "list"
+    ],
+    "golden_answer": "Clearance items, personalized products, opened software, and hygiene-sensitive items are not eligible for return.",
+    "tags": [
+      "returns",
+      "non-returnable"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I exchange an item for a different size?",
+    "expected": [
+      "exchange process",
+      "item exchange"
+    ],
+    "golden_answer": "Yes, you can exchange an item for a different size within the return window.",
+    "tags": [
+      "returns",
+      "exchange",
+      "multi_part"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a laptop after 30 days?",
+    "expected": [
+      "return window",
+      "electronics",
+      "restricted"
+    ],
+    "golden_answer": "No, laptops have a restricted 15-day return window.",
+    "tags": [
+      "electronics",
+      "multi_part",
+      "returns"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Is a damaged item eligible for a refund?",
+    "expected": [
+      "refund",
+      "damaged item",
+      "shipping costs"
+    ],
+    "golden_answer": "Yes, but shipping costs are non-refundable.",
+    "tags": [
+      "returns",
+      "refunds",
+      "damaged"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a personalized item?",
+    "expected": [
+      "return",
+      "personalized item",
+      "non-returnable"
+    ],
+    "golden_answer": "No, personalized items cannot be returned.",
+    "tags": [
+      "returns",
+      "no_answer",
+      "non-returnable"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "What is the return window for most items?",
+    "expected": [
+      "return window",
+      "most items",
+      "30 days"
+    ],
+    "golden_answer": "30 days from the delivery date.",
+    "tags": [
+      "returns",
+      "returns window"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a software item?",
+    "expected": [
+      "return",
+      "software item",
+      "non-returnable"
+    ],
+    "golden_answer": "No, opened software items cannot be returned.",
+    "tags": [
+      "returns",
+      "no_answer",
+      "non-returnable"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "How long does it take to process a refund?",
+    "expected": [
+      "refund",
+      "processing time",
+      "5-7 business days"
+    ],
+    "golden_answer": "5-7 business days.",
+    "tags": [
+      "refunds",
+      "returns"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a clearance item?",
+    "expected": [
+      "return",
+      "clearance item",
+      "non-returnable"
+    ],
+    "golden_answer": "No, clearance items cannot be returned.",
+    "tags": [
+      "returns",
+      "no_answer",
+      "non-returnable"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "What happens if I return an item after 60 days?",
+    "expected": [
+      "return",
+      "60 days",
+      "store credit"
+    ],
+    "golden_answer": "You will receive store credit only.",
+    "tags": [
+      "returns",
+      "returns window",
+      "store credit"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "What is the return window for electronics?",
+    "expected": [
+      "15 days"
+    ],
+    "golden_answer": "15-day return window for electronics",
+    "tags": [
+      "electronics",
+      "returns"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a personalized item?",
+    "expected": [
+      "no"
+    ],
+    "golden_answer": "Personalized items cannot be returned",
+    "tags": [
+      "no_answer",
+      "returns"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "How long does it take to process a refund?",
+    "expected": [
+      "5-7 business days"
+    ],
+    "golden_answer": "5-7 business days for refund processing",
+    "tags": [
+      "returns",
+      "refunds"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return an item that was purchased on sale?",
+    "expected": [
+      "no"
+    ],
+    "golden_answer": "Sale items cannot be returned",
+    "tags": [
+      "returns",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "What happens if I return an item after 30 days?",
+    "expected": [
+      "store credit"
+    ],
+    "golden_answer": "Store credit for late returns",
+    "tags": [
+      "returns",
+      "late returns"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Are shipping costs refundable?",
+    "expected": [
+      "no"
+    ],
+    "golden_answer": "Shipping costs are non-refundable",
+    "tags": [
+      "returns",
+      "refunds",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "Can I exchange an item for a different size?",
+    "expected": [
+      "yes"
+    ],
+    "golden_answer": "Exchanges are available for different sizes",
+    "tags": [
+      "returns",
+      "exchanges"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "What is the return policy for software?",
+    "expected": [
+      "not returnable"
+    ],
+    "golden_answer": "Software is not returnable",
+    "tags": [
+      "returns",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "Can I return a laptop after 30 days?",
+    "expected": [
+      "return window",
+      "electronics",
+      "restricted"
+    ],
+    "golden_answer": "No, laptops have a restricted 15-day return window.",
+    "tags": [
+      "electronics",
+      "returns",
+      "restricted"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I get a refund for a damaged item?",
+    "expected": [
+      "refund",
+      "damaged item",
+      "shipping costs"
+    ],
+    "golden_answer": "Yes, we'll refund your item, but shipping costs are non-refundable.",
+    "tags": [
+      "refunds",
+      "damaged items"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a personalized item?",
+    "expected": [
+      "return window",
+      "personalized item",
+      "non-returnable"
+    ],
+    "golden_answer": "No, personalized items are non-returnable.",
+    "tags": [
+      "returns",
+      "personalized items",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "What happens if I return an item after 60 days?",
+    "expected": [
+      "return window",
+      "late returns",
+      "store credit"
+    ],
+    "golden_answer": "You'll receive store credit, but the item must be in sellable condition.",
+    "tags": [
+      "returns",
+      "late returns",
+      "store credit"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a software item?",
+    "expected": [
+      "return window",
+      "software item",
+      "non-returnable"
+    ],
+    "golden_answer": "No, opened software items are non-returnable.",
+    "tags": [
+      "returns",
+      "software items",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "How long does it take to process a refund?",
+    "expected": [
+      "refund process",
+      "timeframe",
+      "business days"
+    ],
+    "golden_answer": "Please allow 5-7 business days for inspection.",
+    "tags": [
+      "refunds",
+      "refund process"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a face mask?",
+    "expected": [
+      "return window",
+      "face mask",
+      "non-returnable"
+    ],
+    "golden_answer": "No, face masks are non-returnable due to hygiene concerns.",
+    "tags": [
+      "returns",
+      "face masks",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "What is the return window for most items?",
+    "expected": [
+      "return window",
+      "most items",
+      "30 days"
+    ],
+    "golden_answer": "Most items can be returned within 30 days of delivery.",
+    "tags": [
+      "returns",
+      "return window"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a laptop within 30 days?",
+    "expected": [
+      "return window",
+      "laptop",
+      "30 days"
+    ],
+    "golden_answer": "Yes, within 30 days.",
+    "tags": [
+      "electronics",
+      "returns"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a laptop after 60 days?",
+    "expected": [
+      "return window",
+      "laptop",
+      "60 days"
+    ],
+    "golden_answer": "No, returns are not accepted after 60 days.",
+    "tags": [
+      "electronics",
+      "returns",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "Do I get a refund or exchange for a returned item?",
+    "expected": [
+      "refund",
+      "exchange"
+    ],
+    "golden_answer": "Both options are available.",
+    "tags": [
+      "returns",
+      "exchanges"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a personalized item?",
+    "expected": [
+      "return policy",
+      "personalized item"
+    ],
+    "golden_answer": "No, personalized items cannot be returned.",
+    "tags": [
+      "returns",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "What happens if I return an item after 30 days?",
+    "expected": [
+      "return window",
+      "store credit"
+    ],
+    "golden_answer": "You may be eligible for store credit.",
+    "tags": [
+      "returns",
+      "late returns"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a damaged item for a refund?",
+    "expected": [
+      "refund",
+      "damaged item"
+    ],
+    "golden_answer": "No, shipping costs are non-refundable.",
+    "tags": [
+      "returns",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "How long does it take to process a refund?",
+    "expected": [
+      "refund process",
+      "timeframe"
+    ],
+    "golden_answer": "5-7 business days.",
+    "tags": [
+      "returns",
+      "refund process"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a clearance item?",
+    "expected": [
+      "return policy",
+      "clearance item"
+    ],
+    "golden_answer": "No, clearance items cannot be returned.",
+    "tags": [
+      "returns",
+      "no_answer"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "Can I return a laptop after 30 days?",
+    "expected": [
+      "return window",
+      "electronic item",
+      "restricted"
+    ],
+    "golden_answer": "No, laptops have a 15-day return window.",
+    "tags": [
+      "electronics",
+      "return window",
+      "restricted"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "What happens if I return an item after 60 days?",
+    "expected": [
+      "return window",
+      "late return"
+    ],
+    "golden_answer": "Not available in our policy.",
+    "tags": [
+      "no_answer",
+      "late return"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "Can I return a personalized item?",
+    "expected": [
+      "return policy",
+      "personalized item"
+    ],
+    "golden_answer": "No, personalized items cannot be returned.",
+    "tags": [
+      "returns",
+      "personalized"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Do I get a refund for shipping costs if I return an item?",
+    "expected": [
+      "refund policy",
+      "shipping costs"
+    ],
+    "golden_answer": "No, shipping costs are non-refundable unless the item arrived damaged.",
+    "tags": [
+      "returns",
+      "refund process"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a software product if I opened it?",
+    "expected": [
+      "return policy",
+      "opened software"
+    ],
+    "golden_answer": "No, opened software cannot be returned.",
+    "tags": [
+      "returns",
+      "software"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "What is the return window for a tablet?",
+    "expected": [
+      "return window",
+      "tablet"
+    ],
+    "golden_answer": "30 days.",
+    "tags": [
+      "electronics",
+      "return window"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a damaged item for a full refund?",
+    "expected": [
+      "refund policy",
+      "damaged item"
+    ],
+    "golden_answer": "Not available in our policy.",
+    "tags": [
+      "no_answer",
+      "refund process"
+    ],
+    "should_answer": false
+  },
+  {
+    "question": "Can I return an item that is still in sellable condition after 60 days?",
+    "expected": [
+      "return policy",
+      "sellable condition",
+      "late return"
+    ],
+    "golden_answer": "Yes, you can return it for store credit.",
+    "tags": [
+      "returns",
+      "late return"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I return a laptop after 30 days?",
+    "expected": [
+      "return window",
+      "electronic item",
+      "restricted"
+    ],
+    "golden_answer": "No, laptops have a 15-day return window.",
+    "tags": [
+      "electronics",
+      "return window",
+      "restricted"
+    ],
+    "should_answer": true
+  },
+  {
+    "question": "Can I get a refund for a damaged item?",
+    "expected": [
+      "refund",
+      "damaged item",
+      "shipping costs"
+    ],
+    "golden_answer": "Yes, refunds will be credited back to the original payment method.",
+    "tags": [
+      "refund",
+      "damaged item"
+    ],
+    "should_answer": true
+  }
+]
