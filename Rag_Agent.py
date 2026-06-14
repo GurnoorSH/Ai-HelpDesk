@@ -554,9 +554,9 @@ def compress_context(query: str, context: str) -> str:
         return context
 
 
-def _format_candidate(candidate: dict[str, Any], query: str) -> str:
+def _format_candidate(candidate: dict[str, Any], query: str, *, compress: bool = True) -> str:
     context = candidate["parent_context"]
-    compressed_context = compress_context(query, context)
+    compressed_context = compress_context(query, context) if compress else context
     section = candidate.get("section")
     source_line = f"Source: {candidate['source']} (chunk {candidate['chunk_index']})"
     if section:
@@ -564,12 +564,37 @@ def _format_candidate(candidate: dict[str, Any], query: str) -> str:
     return f"{source_line}\n{compressed_context}"
 
 
-def retrieve(query: str, metadata_filter: Optional[dict[str, Any]] = None) -> list[str]:
+def chunk_id_for_retrieval(source: Any, chunk_index: Any) -> str:
+    return f"{source}:{chunk_index}"
+
+
+def _structured_result(candidate: dict[str, Any], query: str, rank: int, *, compress: bool) -> dict[str, Any]:
+    source = candidate["source"]
+    chunk_index = candidate["chunk_index"]
+    return {
+        "rank": rank,
+        "source": source,
+        "chunk_index": chunk_index,
+        "chunk_id": chunk_id_for_retrieval(source, chunk_index),
+        "text": candidate["document"],
+        "section": candidate.get("section"),
+        "formatted_context": _format_candidate(candidate, query, compress=compress),
+    }
+
+
+def retrieve_structured(
+    query: str,
+    metadata_filter: Optional[dict[str, Any]] = None,
+    *,
+    top_n: Optional[int] = None,
+    compress: bool = True,
+) -> list[dict[str, Any]]:
     """
     HyDE dense search + sparse keyword search -> RRF -> rerank -> compression.
     Small chunks are searched and reranked; larger neighboring context is sent
     to the answer model.
     """
+    result_limit = top_n or RERANK_TOP_N
     qdrant_filter = build_metadata_filter(metadata_filter)
     dense_query = generate_hyde_query(query)
     with trace_span(
@@ -626,30 +651,41 @@ def retrieve(query: str, metadata_filter: Optional[dict[str, Any]] = None) -> li
         return []
 
     docs = [candidate["document"] for candidate in candidates]
+    rerank_limit = min(result_limit, len(docs))
     if co:
         try:
             with trace_span(
                 "reranking",
                 run_type="retriever",
                 inputs={"query": query, "candidate_count": len(docs)},
-                metadata={"model": RERANK_MODEL, "top_n": RERANK_TOP_N},
+                metadata={"model": RERANK_MODEL, "top_n": rerank_limit},
             ):
                 reranked = co.rerank(
                     query=query,
                     documents=docs,
                     model=RERANK_MODEL,
-                    top_n=RERANK_TOP_N,
+                    top_n=rerank_limit,
                 )
             return [
-                _format_candidate(candidates[r.index], query)
-                for r in reranked.results
+                _structured_result(candidates[r.index], query, rank, compress=compress)
+                for rank, r in enumerate(reranked.results, start=1)
             ]
         except Exception as e:
             log.warning("Cohere rerank failed (%s), using raw hits", e)
 
     return [
-        _format_candidate(candidate, query)
-        for candidate in candidates[:RERANK_TOP_N]
+        _structured_result(candidate, query, rank, compress=compress)
+        for rank, candidate in enumerate(candidates[:result_limit], start=1)
+    ]
+
+
+def retrieve(query: str, metadata_filter: Optional[dict[str, Any]] = None) -> list[str]:
+    """
+    Return formatted retrieval contexts for the agent's answer-generation path.
+    """
+    return [
+        result["formatted_context"]
+        for result in retrieve_structured(query, metadata_filter=metadata_filter)
     ]
 
 

@@ -214,8 +214,28 @@ The evaluator reports:
 - `answer_relevancy`: whether the generated answer directly addresses the question.
 - `context_precision`: whether retrieval avoided filler or junk context.
 - `context_recall`: whether retrieval captured all facts needed for the expected/golden answer.
+- `hit_at_5`: whether at least one reviewed reference chunk appeared in the top five results.
+- `mrr`: how highly the first reviewed reference chunk ranked.
+- `id_context_precision`: the share of retrieved chunks that match reviewed reference chunks.
+- `id_context_recall`: the share of reviewed reference chunks that retrieval found.
 - `rouge_l`: lexical overlap between the generated answer and the `golden_answer`.
-- token and cost metrics by stage, including router, HyDE, compression, final answer, critic, and evaluator stages when usage data is returned by Groq-compatible APIs.
+- latency, token, and cost metrics by stage, including router, HyDE, compression, final answer, critic, and evaluator stages when usage data is returned by Groq-compatible APIs.
+
+Use `rag_eval_set.reviewed.json` for objective retrieval metrics and regression gates. It exists because synthetic questions and LLM judges cannot objectively prove that retrieval found the correct source chunk. Each reviewed case records the human-checked expected answer and stable `reference_chunks` such as `Store_Return_Policy.pdf:0`, allowing deterministic Hit@5, MRR, ID precision, and ID recall scores. The file also includes `case_type`, `reviewed`, and `reviewer` metadata so the trusted regression set stays separate from generated draft cases.
+
+Run an inexpensive retrieval-only gate:
+
+```powershell
+python evaluate_rag.py .\rag_eval_set.reviewed.json --retrieval-only --fail-on-threshold --min-hit-at-5 0.90 --min-mrr 0.70
+```
+
+Run a full generation-quality gate:
+
+```powershell
+python evaluate_rag.py .\rag_eval_set.reviewed.json --fail-on-threshold --min-faithfulness 0.80 --min-answer-relevancy 0.80 --min-context-recall 0.80
+```
+
+Available operational gates include `--max-average-latency-ms` and `--max-known-cost-usd`. Gated runs also fail when any case errors before its metrics can be recorded.
 
 Run this evaluator every time you change retrieval settings in `Rag_Agent.py`, especially `CHUNK_SIZE`, `CHUNK_OVERLAP`, `RETRIEVAL_LIMIT`, `RERANK_TOP_N`, or `RERANK_MODEL`.
 
@@ -233,6 +253,8 @@ streamlit run rag_dashboard.py
 
 The dashboard shows latest scores, RAGAS status, metric trends across saved reports, low-scoring cases, generated answers, golden answers, and retrieved context.
 
+When the dashboard is launched as a background process, `.streamlit-dashboard.out.log` and `.streamlit-dashboard.err.log` capture its standard output and errors. They are disposable runtime files, are ignored by Git, and can be deleted whenever the dashboard is stopped. If deleted while the dashboard is running, Windows may keep the active file handles open or the logs may be recreated on the next launch.
+
 ## Stop Everything
 
 To stop Docker services, go back to Terminal 1 and press `Ctrl+C`.
@@ -249,6 +271,8 @@ The policy/RAG path expects documents to be ingested into Qdrant before it can a
 The current demo runner calls `ingest_document(POLICY_DOC_PATH, doc_type="policy")` automatically; if you later wrap the agent in an API, make ingestion a startup/admin step instead of doing it per request.
 
 Do not commit your `.env` file. It contains secrets and is already ignored by Git.
+
+`.python-version` pins this project to Python 3.11 for tools such as `uv` and pyenv. It contains no secrets and is recommended to keep and commit so contributors use a compatible Python version. It is safe to delete, but `uv` or pyenv may then choose a different installed Python version.
 
 ## Future Scope
 

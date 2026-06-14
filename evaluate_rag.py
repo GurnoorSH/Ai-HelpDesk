@@ -26,11 +26,12 @@ from Rag_Agent import (
     FINAL_LLM_MODEL,
     LLM_BASE_URL,
     QDRANT_URL,
+    RERANK_TOP_N,
     extract_metadata_filter,
     generate_verified_answer,
     llm,
     qdrant,
-    retrieve,
+    retrieve_structured,
 )
 from observability import (
     PRICE_CONFIG,
@@ -41,6 +42,21 @@ from observability import (
 
 
 REPORTS_DIR = Path("reports")
+RETRIEVAL_EVAL_TOP_K = 5
+GENERATION_METRIC_KEYS = [
+    "faithfulness",
+    "answer_relevancy",
+    "context_precision",
+    "context_recall",
+    "rouge_l",
+]
+RETRIEVAL_METRIC_KEYS = [
+    "hit_at_5",
+    "mrr",
+    "id_context_precision",
+    "id_context_recall",
+]
+SUMMARY_METRIC_KEYS = GENERATION_METRIC_KEYS + RETRIEVAL_METRIC_KEYS
 
 
 class EvaluationResult(BaseModel):
@@ -142,15 +158,24 @@ def average(values: list[float]) -> float:
     return mean(values) if values else 0.0
 
 
+def average_optional(values: list[Any]) -> float | None:
+    finite_values = [
+        numeric
+        for value in values
+        for numeric in [finite_float(value)]
+        if numeric is not None
+    ]
+    return average(finite_values) if finite_values else None
+
+
 def summarize_cases(case_reports: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
+    summary: dict[str, Any] = {
         "cases": len(case_reports),
-        "faithfulness": average([case["metrics"]["faithfulness"] for case in case_reports]),
-        "answer_relevancy": average([case["metrics"]["answer_relevancy"] for case in case_reports]),
-        "context_precision": average([case["metrics"]["context_precision"] for case in case_reports]),
-        "context_recall": average([case["metrics"]["context_recall"] for case in case_reports]),
-        "rouge_l": average([case["metrics"]["rouge_l"] for case in case_reports]),
+        "case_errors": sum(1 for case in case_reports if case.get("error")),
     }
+    for key in SUMMARY_METRIC_KEYS:
+        summary[key] = average_optional([case.get("metrics", {}).get(key) for case in case_reports])
+    return summary
 
 
 def summarize_usage(case_reports: list[dict[str, Any]]) -> dict[str, Any]:
@@ -196,6 +221,29 @@ def summarize_usage(case_reports: list[dict[str, Any]]) -> dict[str, Any]:
         "known_cost_usd": total_known_cost,
         "unknown_cost_stages": unknown_cost_stages,
         "by_stage": by_stage,
+    }
+
+
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, math.ceil((pct / 100.0) * len(ordered)) - 1))
+    return ordered[index]
+
+
+def summarize_latency(case_reports: list[dict[str, Any]]) -> dict[str, float]:
+    durations = [
+        float(usage.get("duration_ms"))
+        for case in case_reports
+        for usage in [case.get("usage") or {}]
+        if finite_float(usage.get("duration_ms")) is not None
+    ]
+    return {
+        "average_case_duration_ms": average(durations),
+        "p50_case_duration_ms": percentile(durations, 50),
+        "p95_case_duration_ms": percentile(durations, 95),
+        "max_case_duration_ms": max(durations) if durations else 0.0,
     }
 
 
@@ -261,6 +309,109 @@ def finite_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return numeric if math.isfinite(numeric) else None
+
+
+def normalize_reference_chunks(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def deterministic_retrieval_metrics(
+    retrieval_results: list[dict[str, Any]],
+    reference_chunks: list[str],
+    *,
+    top_k: int = RETRIEVAL_EVAL_TOP_K,
+) -> dict[str, float | None]:
+    if not reference_chunks:
+        return {
+            "hit_at_5": None,
+            "mrr": None,
+            "id_context_precision": None,
+            "id_context_recall": None,
+        }
+
+    expected = set(reference_chunks)
+    retrieved_ids = [str(result.get("chunk_id", "")).strip() for result in retrieval_results if result.get("chunk_id")]
+    top_k_ids = retrieved_ids[:top_k]
+    first_match_rank = next(
+        (rank for rank, chunk_id in enumerate(retrieved_ids, start=1) if chunk_id in expected),
+        None,
+    )
+    retrieved_matches = {chunk_id for chunk_id in retrieved_ids if chunk_id in expected}
+
+    return {
+        "hit_at_5": 1.0 if any(chunk_id in expected for chunk_id in top_k_ids) else 0.0,
+        "mrr": (1.0 / first_match_rank) if first_match_rank else 0.0,
+        "id_context_precision": (len(retrieved_matches) / len(retrieved_ids)) if retrieved_ids else 0.0,
+        "id_context_recall": len(retrieved_matches) / len(expected),
+    }
+
+
+def threshold_value(args: argparse.Namespace, name: str) -> float | None:
+    return finite_float(getattr(args, name, None))
+
+
+def evaluate_thresholds(
+    summary: dict[str, Any],
+    usage_summary: dict[str, Any],
+    latency_summary: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    checks = [
+        ("min_faithfulness", "faithfulness", ">=", summary.get("faithfulness")),
+        ("min_answer_relevancy", "answer_relevancy", ">=", summary.get("answer_relevancy")),
+        ("min_context_recall", "context_recall", ">=", summary.get("context_recall")),
+        ("min_hit_at_5", "hit_at_5", ">=", summary.get("hit_at_5")),
+        ("min_mrr", "mrr", ">=", summary.get("mrr")),
+        ("max_average_latency_ms", "average_case_duration_ms", "<=", latency_summary.get("average_case_duration_ms")),
+        ("max_known_cost_usd", "known_cost_usd", "<=", usage_summary.get("known_cost_usd")),
+    ]
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    if args.fail_on_threshold and int(summary.get("case_errors") or 0) > 0:
+        case_error_check = {
+            "argument": "fail_on_threshold",
+            "metric": "case_errors",
+            "operator": "==",
+            "threshold": 0,
+            "actual": int(summary["case_errors"]),
+            "passed": False,
+        }
+        results.append(case_error_check)
+        failures.append(case_error_check)
+    for arg_name, metric_name, operator, actual_value in checks:
+        limit = threshold_value(args, arg_name)
+        if limit is None:
+            continue
+        actual = finite_float(actual_value)
+        passed = actual is not None and (actual >= limit if operator == ">=" else actual <= limit)
+        row = {
+            "argument": arg_name,
+            "metric": metric_name,
+            "operator": operator,
+            "threshold": limit,
+            "actual": actual,
+            "passed": passed,
+        }
+        results.append(row)
+        if not passed:
+            failures.append(row)
+    return {
+        "enabled": bool(args.fail_on_threshold),
+        "passed": not failures,
+        "checks": results,
+        "failures": failures,
+    }
+
+
+def format_metric(value: Any) -> str:
+    numeric = finite_float(value)
+    return "n/a" if numeric is None else f"{numeric:.2f}"
 
 
 def ragas_case_payload(case: dict[str, Any]) -> dict[str, Any]:
@@ -390,6 +541,23 @@ def main() -> None:
         default=float(os.getenv("RAGAS_CASE_SLEEP_SECONDS", "65")),
         help="Seconds to sleep between one-case RAGAS evaluations.",
     )
+    parser.add_argument("--min-faithfulness", type=float, default=None, help="Minimum run faithfulness score.")
+    parser.add_argument("--min-answer-relevancy", type=float, default=None, help="Minimum answer relevancy score.")
+    parser.add_argument("--min-context-recall", type=float, default=None, help="Minimum LLM-judged context recall score.")
+    parser.add_argument("--min-hit-at-5", type=float, default=None, help="Minimum deterministic Hit@5 score.")
+    parser.add_argument("--min-mrr", type=float, default=None, help="Minimum deterministic MRR score.")
+    parser.add_argument(
+        "--max-average-latency-ms",
+        type=float,
+        default=None,
+        help="Maximum average case duration in milliseconds.",
+    )
+    parser.add_argument("--max-known-cost-usd", type=float, default=None, help="Maximum known eval run cost in USD.")
+    parser.add_argument(
+        "--fail-on-threshold",
+        action="store_true",
+        help="Exit with status 1 when any configured threshold fails.",
+    )
     args = parser.parse_args()
 
     cases = json.loads(args.test_set.read_text(encoding="utf-8-sig"))
@@ -401,22 +569,53 @@ def main() -> None:
         question = case["question"]
         expected = case.get("expected", "")
         golden_answer = case.get("golden_answer") or expected
+        reference_chunks = normalize_reference_chunks(case.get("reference_chunks"))
         with usage_run(f"eval_case_{index}"):
-            passages = retrieve(question, metadata_filter=extract_metadata_filter(question))
-            context = "\n\n---\n\n".join(passages)
-            generated_answer = (
-                "[retrieval-only]"
-                if args.retrieval_only
-                else generate_verified_answer(question, context, messages=[])
+            retrieval_results = retrieve_structured(
+                question,
+                metadata_filter=extract_metadata_filter(question),
+                top_n=max(RETRIEVAL_EVAL_TOP_K, RERANK_TOP_N),
+                compress=not args.retrieval_only,
             )
-            result = judge_case(question, expected, golden_answer, generated_answer, context)
+            passages = [
+                result["formatted_context"]
+                for result in retrieval_results[:RERANK_TOP_N]
+            ]
+            context = "\n\n---\n\n".join(passages)
+            result: EvaluationResult | None = None
+            case_error = ""
+            generated_answer = "[generation-error]"
+            if args.retrieval_only:
+                generated_answer = "[retrieval-only]"
+            else:
+                try:
+                    generated_answer = generate_verified_answer(question, context, messages=[])
+                    result = judge_case(question, expected, golden_answer, generated_answer, context)
+                except Exception as e:
+                    case_error = f"{type(e).__name__}: {e}"
             usage_report = current_usage_report()
-        rouge_score = 0.0 if args.retrieval_only else rouge_l_f1(generated_answer, golden_answer)
-        result_metrics = result.model_dump(exclude={"reason"}) if hasattr(result, "model_dump") else result.dict(
-            exclude={"reason"}
-        )
+        rouge_score = None if args.retrieval_only else rouge_l_f1(generated_answer, golden_answer)
+        if result is None:
+            result_metrics = {
+                "faithfulness": None,
+                "answer_relevancy": None,
+                "context_precision": None,
+                "context_recall": None,
+            }
+            reason = (
+                "Retrieval-only run skipped answer generation and the LLM judge."
+                if args.retrieval_only
+                else f"Case failed before judge metrics could be recorded: {case_error}"
+            )
+        else:
+            result_metrics = result.model_dump(exclude={"reason"}) if hasattr(result, "model_dump") else result.dict(
+                exclude={"reason"}
+            )
+            reason = result.reason
+        retrieval_metrics = deterministic_retrieval_metrics(retrieval_results, reference_chunks)
         metrics = {
             **result_metrics,
+            **retrieval_metrics,
             "rouge_l": rouge_score,
         }
         case_report = {
@@ -426,33 +625,43 @@ def main() -> None:
             "golden_answer": golden_answer,
             "generated_answer": generated_answer,
             "passages": passages,
+            "retrieval_results": retrieval_results,
             "context": context,
             "metrics": metrics,
-            "reason": result.reason,
+            "reason": reason,
+            "error": case_error,
             "tags": case.get("tags", []),
             "should_answer": case.get("should_answer"),
+            "case_type": case.get("case_type"),
+            "reviewed": case.get("reviewed"),
+            "reviewer": case.get("reviewer"),
+            "reference_chunks": reference_chunks,
             "usage": usage_report,
         }
         case_reports.append(case_report)
         print(
-            f"{index}. faithfulness={metrics['faithfulness']:.2f} "
-            f"answer_relevancy={metrics['answer_relevancy']:.2f} "
-            f"context_precision={metrics['context_precision']:.2f} "
-            f"context_recall={metrics['context_recall']:.2f} "
-            f"rouge_l={metrics['rouge_l']:.2f} - {result.reason}"
+            f"{index}. faithfulness={format_metric(metrics['faithfulness'])} "
+            f"answer_relevancy={format_metric(metrics['answer_relevancy'])} "
+            f"context_precision={format_metric(metrics['context_precision'])} "
+            f"context_recall={format_metric(metrics['context_recall'])} "
+            f"hit_at_5={format_metric(metrics['hit_at_5'])} "
+            f"mrr={format_metric(metrics['mrr'])} "
+            f"rouge_l={format_metric(metrics['rouge_l'])} - {reason}"
         )
         if index < len(cases) and args.case_sleep > 0:
             time.sleep(args.case_sleep)
 
     summary = summarize_cases(case_reports)
     usage_summary = summarize_usage(case_reports)
-    ragas_report = run_ragas(case_reports, args.ragas_model, args.ragas_sleep) if args.ragas else {
+    latency_summary = summarize_latency(case_reports)
+    ragas_report = run_ragas(case_reports, args.ragas_model, args.ragas_sleep) if args.ragas and not args.retrieval_only else {
         "enabled": False,
-        "status": "not_requested",
+        "status": "not_requested" if not args.retrieval_only else "skipped_for_retrieval_only",
         "error": "",
         "summary": {},
         "cases": [],
     }
+    thresholds = evaluate_thresholds(summary, usage_summary, latency_summary, args)
     run_id = datetime.now(timezone.utc).strftime("rag_eval_%Y%m%d_%H%M%S")
     report = {
         "run_id": run_id,
@@ -468,6 +677,8 @@ def main() -> None:
         "ragas": ragas_report,
         "summary": summary,
         "usage": usage_summary,
+        "latency": latency_summary,
+        "thresholds": thresholds,
         "pricing": {
             "source": "GROQ_MODEL_PRICES_JSON",
             "configured_models": sorted(PRICE_CONFIG.keys()),
@@ -478,19 +689,32 @@ def main() -> None:
     if case_reports:
         print("\nSummary")
         for key, value in summary.items():
-            print(f"{key}={value:.2f}" if isinstance(value, float) else f"{key}={value}")
+            print(f"{key}={value}" if key in {"cases", "case_errors"} else f"{key}={format_metric(value)}")
         print(f"tokens={usage_summary['total_tokens']}")
         print(f"known_cost_usd={usage_summary['known_cost_usd']:.6f}")
+        print(f"average_case_duration_ms={latency_summary['average_case_duration_ms']:.2f}")
+        print(f"p95_case_duration_ms={latency_summary['p95_case_duration_ms']:.2f}")
         if usage_summary["unknown_cost_stages"]:
             print(f"unknown_cost_stages={','.join(usage_summary['unknown_cost_stages'])}")
         if ragas_report["status"] == "ok":
             print("ragas_status=ok")
         elif args.ragas:
             print(f"ragas_status={ragas_report['status']} error={ragas_report['error']}")
+        if thresholds["checks"]:
+            print("thresholds=" + ("passed" if thresholds["passed"] else "failed"))
+            for failure in thresholds["failures"]:
+                print(
+                    "threshold_failure="
+                    f"{failure['metric']} actual={failure['actual']} "
+                    f"{failure['operator']} {failure['threshold']}"
+                )
 
     if not args.no_report:
         output_path = write_report(report, args.reports_dir)
         print(f"\nWrote report: {output_path}")
+
+    if args.fail_on_threshold and not thresholds["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
