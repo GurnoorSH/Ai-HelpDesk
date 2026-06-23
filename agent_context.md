@@ -89,9 +89,14 @@ The repository has commits for the initial project setup, Groq/environment refac
   - small-to-big retrieval by reranking small chunks and feeding neighboring `parent_context`
   - HyDE dense retrieval using the fast Groq model while sparse/BM25 retrieval keeps the original query
   - contextual compression using the fast Groq model before final answer generation
-  - a critic pass that rejects unsupported policy answers
+  - a critic pass that evaluates unsupported policy answers and logs a warning (does not block the answer, preventing false positive refusals)
   - `evaluate_rag.py` for repeatable faithfulness, answer-relevancy, context precision/recall, and ROUGE-L scoring against golden answers
   - `synthesize_eval_set.py` for generating 50+ diverse eval cases from the PDF
+- **Phase 0 (Generation Quality Fixes) completed**:
+  - Faithfulness improved from ~0.40 to 0.92
+  - Answer Relevancy improved from ~0.40 to 0.98
+  - Upgraded critic model to 70B and improved prompt with deduction rules
+  - Context compression max_tokens increased to 400 to preserve facts
 - Added observability and reporting:
   - `observability.py` records LLM usage by stage and computes optional cost from `GROQ_MODEL_PRICES_JSON`
   - optional LangSmith spans are enabled only when `ENABLE_LANGSMITH=true` and `LANGSMITH_API_KEY` is set

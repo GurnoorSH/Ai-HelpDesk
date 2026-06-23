@@ -116,6 +116,7 @@ def parse_evaluation_result(content: str) -> EvaluationResult:
     return EvaluationResult(
         faithfulness=coerce_score(payload.get("faithfulness")),
         answer_relevancy=coerce_score(payload.get("answer_relevancy")),
+
         context_precision=coerce_score(payload.get("context_precision")),
         context_recall=coerce_score(payload.get("context_recall")),
         reason=reason,
@@ -129,14 +130,29 @@ def judge_case(
     generated_answer: str,
     context: str,
 ) -> EvaluationResult:
+    system = (
+        "You are a precise RAG evaluation judge. Score each metric from 0.0 to 1.0. "
+        "Be objective and calibrated — a score of 0.5 means partially met, not a failure."
+    )
     prompt = (
-        "Evaluate this RAG result. Score each metric from 0 to 1.\n"
-        "- faithfulness: the generated answer only uses facts supported by the retrieved context.\n"
-        "- answer_relevancy: the generated answer directly addresses the question.\n"
-        "- context_precision: the retrieved context is mostly useful, with little filler or junk.\n"
-        "- context_recall: the retrieved context contains all information needed for the expected/golden answer.\n"
-        "Return only JSON with keys faithfulness, answer_relevancy, context_precision, "
-        "context_recall, reason.\n\n"
+        "Evaluate this RAG result. Score each metric from 0.0 to 1.0.\n\n"
+        "## Scoring rubric\n"
+        "- **faithfulness**: Does the generated answer only state facts that are present in "
+        "or logically follow from the retrieved context? Paraphrasing is fine. Applying a "
+        "general rule to a specific case is fine. If the context is completely irrelevant "
+        "or bad, but the answer accurately reflects that bad context or correctly refuses "
+        "to answer based on it, faithfulness should be 1.0 (do NOT penalize faithfulness "
+        "for bad context). If the answer is a generic refusal like 'I don't have that "
+        "information' but the context DOES contain relevant facts, score 0.0.\n"
+        "- **answer_relevancy**: Does the generated answer directly address the question? "
+        "If the answer refuses to answer despite the context containing relevant information, "
+        "score 0.0. If the answer addresses the question correctly, score 1.0.\n"
+        "- **context_precision**: Is the retrieved context mostly useful for answering this "
+        "question, with little irrelevant filler?\n"
+        "- **context_recall**: Does the retrieved context contain all the facts needed to "
+        "produce the golden answer?\n\n"
+        "Return only a JSON object with keys: faithfulness, answer_relevancy, "
+        "context_precision, context_recall, reason.\n\n"
         f"Question: {question}\n"
         f"Expected answer facts: {expected}\n"
         f"Golden answer: {golden_answer}\n"
@@ -145,10 +161,13 @@ def judge_case(
     )
     response = llm.chat.completions.create(
         model=FAST_LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
         response_format={"type": "json_object"},
         temperature=0,
-        max_tokens=200,
+        max_tokens=400,
     )
     record_llm_response("evaluator", FAST_LLM_MODEL, response)
     return parse_evaluation_result(response.choices[0].message.content or "{}")

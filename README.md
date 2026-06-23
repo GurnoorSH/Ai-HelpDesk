@@ -11,6 +11,7 @@ Configuration is local-first: secrets and model settings come from `.env` / envi
 ## What Is Inside
 
 - `Rag_Agent.py` - main helpdesk agent with intent routing, retrieval, reranking, and answer generation.
+- `frontend/` - Next.js support workspace with chat UI and consolidated admin dashboard.
 - `evaluate_rag.py` - lightweight RAG evaluator for retrieval and generated-answer quality.
 - `synthesize_eval_set.py` - creates a synthetic eval set from the policy PDF.
 - `observability.py` - optional LangSmith tracing plus per-stage token and cost accounting.
@@ -142,6 +143,23 @@ python Rag_Agent.py
 
 The demo runner sends a few sample queries through the agent, including order tracking and policy-style questions.
 At startup, the runner ingests `POLICY_DOC_PATH` into the `helpdesk_policy` Qdrant collection, then executes the sample turns.
+
+### Optional: Run The Next.js Frontend
+
+The frontend currently runs with demo data by default and is ready to point at the Phase 1 backend API when `/api/chat`, `/api/stats`, and triage endpoints are available.
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open:
+
+- Chat workspace: `http://localhost:3000`
+- Consolidated admin dashboard: `http://localhost:3000/admin`
+
+Set `NEXT_PUBLIC_DEMO_MODE=false` and `NEXT_PUBLIC_API_BASE_URL=http://localhost:8080` when the backend API is serving chat requests.
 
 ## RAG Quality And Guardrails
 
